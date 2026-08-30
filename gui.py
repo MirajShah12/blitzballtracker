@@ -3,6 +3,9 @@ Blitzball Pitch Tracker & Game Engine - Professional Broadcast Interface (PySide
 
 Features:
 - Clean, broadcast-grade sports analytics interface without clutter.
+- Chromatic Color Contrast Amplification (2G-R-B for neon, 2B-R-G for blue).
+- Interactive Live Vision Mask (view what the computer vision sees in real-time).
+- 1-Click Interactive Ball Color Sampler (click the ball on screen to auto-calibrate).
 - Multi-color Blitzball tracking (Neon Green/Yellow & Light Blue).
 - Restricted Pitch Corridor ROI with adjustable margin to eliminate ground noise.
 - Strike zone calibration and K-Zone 9-box visualization.
@@ -46,6 +49,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -288,6 +292,22 @@ QSlider::handle:horizontal {
     margin-bottom: -4px;
     border-radius: 7px;
 }
+
+QCheckBox {
+    color: #cbd5e1;
+    font-weight: 600;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid #30363d;
+    background: #0d1117;
+}
+QCheckBox::indicator:checked {
+    background-color: #2563eb;
+    border-color: #3b82f6;
+}
 """
 
 
@@ -385,9 +405,10 @@ class VideoThread(QThread):
 # Interactive Video Canvas
 # ---------------------------------------------------------------------------
 class VideoCanvas(QWidget):
-    """Video rendering canvas with strike zone, detection corridor, and trajectory."""
+    """Video rendering canvas with strike zone, detection corridor, trajectory, and diagnostic mask view."""
 
     calibration_completed = Signal(list)
+    color_sampled = Signal(int, int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -396,14 +417,18 @@ class VideoCanvas(QWidget):
         self.setMouseTracking(True)
 
         self.current_frame: Optional[np.ndarray] = None
+        self.diagnostic_mask: Optional[np.ndarray] = None
         self.zone_polygon: Optional[np.ndarray] = None
         self.roi_box: Optional[Tuple[int, int, int, int]] = None
         self.trajectory: List[Tuple[int, int, float]] = []
+        self.ball_radius: int = 14
 
-        # Calibration state
+        # Modes
         self.is_calibrating: bool = False
-        self.calibration_points: List[Tuple[int, int]] = []
+        self.is_sampling_color: bool = False
+        self.show_diagnostic_mask: bool = False
         self.show_corridor: bool = True
+        self.calibration_points: List[Tuple[int, int]] = []
 
         # Call alert overlay
         self.alert_text: str = ""
@@ -418,8 +443,10 @@ class VideoCanvas(QWidget):
         trajectory: List[Tuple[int, int, float]],
         zone_polygon: Optional[np.ndarray],
         roi_box: Optional[Tuple[int, int, int, int]] = None,
+        diagnostic_mask: Optional[np.ndarray] = None,
     ):
         self.current_frame = frame
+        self.diagnostic_mask = diagnostic_mask
         self.trajectory = trajectory
         self.zone_polygon = zone_polygon
         self.roi_box = roi_box
@@ -427,17 +454,19 @@ class VideoCanvas(QWidget):
 
     def start_calibration(self):
         self.is_calibrating = True
+        self.is_sampling_color = False
         self.calibration_points = []
         self.trigger_alert("CALIBRATION: Click Top-Left Corner", QColor("#38bdf8"), duration_ms=2500)
         self.update()
 
-    def cancel_calibration(self):
+    def start_color_sampling(self):
+        self.is_sampling_color = True
         self.is_calibrating = False
-        self.calibration_points = []
+        self.trigger_alert("COLOR SAMPLER: Click directly on the ball", QColor("#f59e0b"), duration_ms=3000)
         self.update()
 
     def mousePressEvent(self, event):
-        if not self.is_calibrating or self.current_frame is None:
+        if self.current_frame is None:
             return
 
         if event.button() == Qt.LeftButton:
@@ -453,19 +482,28 @@ class VideoCanvas(QWidget):
             if ox <= click_x <= ox + fw * scale and oy <= click_y <= oy + fh * scale:
                 fx = int((click_x - ox) / scale)
                 fy = int((click_y - oy) / scale)
-                self.calibration_points.append((fx, fy))
 
-                labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
-                if len(self.calibration_points) < 4:
-                    next_lbl = labels[len(self.calibration_points)]
-                    self.trigger_alert(f"Click {next_lbl} Corner", QColor("#38bdf8"), duration_ms=1800)
-                else:
-                    self.is_calibrating = False
-                    self.zone_polygon = np.array(self.calibration_points, dtype=np.int32)
-                    self.calibration_completed.emit(self.calibration_points)
-                    self.trigger_alert("Strike Zone Calibrated", QColor("#10b981"), duration_ms=2200)
+                # 1. Color Sampling Mode
+                if self.is_sampling_color:
+                    self.is_sampling_color = False
+                    self.color_sampled.emit(fx, fy)
+                    self.trigger_alert("Ball Color Calibrated!", QColor("#10b981"), duration_ms=2200)
+                    self.update()
+                    return
 
-                self.update()
+                # 2. Strike Zone Calibration Mode
+                if self.is_calibrating:
+                    self.calibration_points.append((fx, fy))
+                    labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
+                    if len(self.calibration_points) < 4:
+                        next_lbl = labels[len(self.calibration_points)]
+                        self.trigger_alert(f"Click {next_lbl} Corner", QColor("#38bdf8"), duration_ms=1800)
+                    else:
+                        self.is_calibrating = False
+                        self.zone_polygon = np.array(self.calibration_points, dtype=np.int32)
+                        self.calibration_completed.emit(self.calibration_points)
+                        self.trigger_alert("Strike Zone Calibrated", QColor("#10b981"), duration_ms=2200)
+                    self.update()
 
     def trigger_alert(self, text: str, color: QColor, duration_ms: int = 1500):
         self.alert_text = text
@@ -498,17 +536,23 @@ class VideoCanvas(QWidget):
         dw, dh = int(fw * scale), int(fh * scale)
         ox, oy = int((ww - dw) / 2), int((wh - dh) / 2)
 
-        # Convert OpenCV BGR to QImage
-        rgb_frame = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
-        bytes_per_line = 3 * fw
-        qimg = QImage(rgb_frame.data, fw, fh, bytes_per_line, QImage.Format_RGB888)
+        # Decide whether to draw Vision Mask or Raw Video
+        if self.show_diagnostic_mask and self.diagnostic_mask is not None:
+            mask_rgb = cv2.cvtColor(self.diagnostic_mask, cv2.COLOR_GRAY2RGB)
+            # Tint vision mask cyan
+            mask_rgb[:, :, 0] = 0
+            qimg = QImage(mask_rgb.data, fw, fh, 3 * fw, QImage.Format_RGB888)
+        else:
+            rgb_frame = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+            qimg = QImage(rgb_frame.data, fw, fh, 3 * fw, QImage.Format_RGB888)
+
         pixmap = QPixmap.fromImage(qimg).scaled(dw, dh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         painter.drawPixmap(ox, oy, pixmap)
 
         def to_widget(fx: float, fy: float) -> QPointF:
             return QPointF(ox + fx * scale, oy + fy * scale)
 
-        # 1. Draw Pitch Detection Corridor (ROI bounding area)
+        # 1. Pitch Corridor ROI Bounding Box
         if self.roi_box is not None and not self.is_calibrating and self.show_corridor:
             rx1, ry1, rx2, ry2 = self.roi_box
             p_top_left = to_widget(rx1, ry1)
@@ -521,9 +565,9 @@ class VideoCanvas(QWidget):
 
             painter.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
             painter.setPen(QColor(56, 189, 248, 140))
-            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Pitch Detection Corridor")
+            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Pitch Corridor")
 
-        # 2. Draw Strike Zone Polygon & K-Zone Grid
+        # 2. Strike Zone Polygon & K-Zone Grid
         poly_to_draw = (
             self.calibration_points
             if self.is_calibrating
@@ -538,7 +582,6 @@ class VideoCanvas(QWidget):
                 painter.setPen(QPen(QColor(16, 185, 129, 220), 2.2, Qt.SolidLine))
                 painter.drawPolygon(qpoly)
 
-                # 9-box K-Zone Grid lines
                 p0 = to_widget(poly_to_draw[0][0], poly_to_draw[0][1])
                 p1 = to_widget(poly_to_draw[1][0], poly_to_draw[1][1])
                 p2 = to_widget(poly_to_draw[2][0], poly_to_draw[2][1])
@@ -564,7 +607,7 @@ class VideoCanvas(QWidget):
                         prev = to_widget(poly_to_draw[i - 1][0], poly_to_draw[i - 1][1])
                         painter.drawLine(prev, pt)
 
-        # 3. Draw Pitch Trajectory Trail
+        # 3. Trajectory Path
         if len(self.trajectory) >= 2:
             path = QPainterPath()
             start = to_widget(self.trajectory[0][0], self.trajectory[0][1])
@@ -574,35 +617,27 @@ class VideoCanvas(QWidget):
                 pt = to_widget(self.trajectory[i][0], self.trajectory[i][1])
                 path.lineTo(pt)
 
-            # Outer glow
             painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(QColor(234, 179, 8, 80), 7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
-            # Core line
             painter.setPen(QPen(QColor(250, 204, 21, 230), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
-        # 4. Draw Hollow Ball Target Reticle (Hollow outline - does not cover the ball)
+        # 4. Hollow Target Outline around Ball (never obscures the ball)
         if self.trajectory:
             last_pt = to_widget(self.trajectory[-1][0], self.trajectory[-1][1])
-            rad = getattr(self, "ball_radius", 14)
-            rad = max(10, min(36, int(rad * scale)))
+            rad = max(10, min(36, int(self.ball_radius * scale)))
 
-            # Transparent center (strictly no solid brush fill)
             painter.setBrush(Qt.NoBrush)
-
-            # Outer soft glow ring
-            painter.setPen(QPen(QColor(56, 189, 248, 100), 5, Qt.SolidLine))
+            painter.setPen(QPen(QColor(56, 189, 248, 90), 4, Qt.SolidLine))
             painter.drawEllipse(last_pt, rad + 2, rad + 2)
 
-            # Crisp neon green/cyan outline ring
             painter.setPen(QPen(QColor(56, 189, 248, 240), 2.2, Qt.SolidLine))
             painter.drawEllipse(last_pt, rad, rad)
 
-            # Corner target brackets
             tick = max(4, int(rad * 0.4))
-            painter.setPen(QPen(QColor(56, 189, 248, 210), 1.6, Qt.SolidLine))
+            painter.setPen(QPen(QColor(56, 189, 248, 200), 1.6, Qt.SolidLine))
             painter.drawLine(int(last_pt.x() - rad - tick), int(last_pt.y()), int(last_pt.x() - rad + 2), int(last_pt.y()))
             painter.drawLine(int(last_pt.x() + rad - 2), int(last_pt.y()), int(last_pt.x() + rad + tick), int(last_pt.y()))
             painter.drawLine(int(last_pt.x()), int(last_pt.y() - rad - tick), int(last_pt.x()), int(last_pt.y() - rad + 2))
@@ -626,8 +661,6 @@ class VideoCanvas(QWidget):
 # Scorebug Header
 # ---------------------------------------------------------------------------
 class ModernScorebug(QFrame):
-    """Clean broadcast scorebug header with Inning, Score, Balls, Strikes, Outs, and Lob Status."""
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ScorebugCard")
@@ -644,13 +677,11 @@ class ModernScorebug(QFrame):
         layout.setContentsMargins(14, 8, 14, 8)
         layout.setSpacing(18)
 
-        # Inning Badge
         self.inning_label = QLabel("TOP 1")
         self.inning_label.setFont(QFont("Segoe UI", 15, QFont.Black))
         self.inning_label.setStyleSheet("color: #38bdf8; background: #0f172a; padding: 7px 12px; border-radius: 6px; border: 1px solid #0284c7;")
         layout.addWidget(self.inning_label)
 
-        # Team Scores: AWAY vs HOME
         score_layout = QHBoxLayout()
         self.away_name = QLabel("AWAY")
         self.away_name.setFont(QFont("Segoe UI", 13, QFont.Bold))
@@ -679,7 +710,6 @@ class ModernScorebug(QFrame):
         score_layout.addWidget(self.home_name)
         layout.addLayout(score_layout)
 
-        # Matchup Info
         matchup_layout = QVBoxLayout()
         self.pitcher_label = QLabel("P: Pitcher 1")
         self.pitcher_label.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
@@ -695,7 +725,6 @@ class ModernScorebug(QFrame):
 
         layout.addStretch()
 
-        # Count & Outs LED Matrix (5 Balls, 3 Strikes, 3 Outs)
         self.count_container = QWidget()
         count_layout = QGridLayout(self.count_container)
         count_layout.setContentsMargins(0, 0, 0, 0)
@@ -743,7 +772,6 @@ class ModernScorebug(QFrame):
 
         layout.addWidget(self.count_container)
 
-        # 2 Lobs Phase Badge
         self.lob_banner = QLabel("2 LOBS ACTIVE")
         self.lob_banner.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.lob_banner.setStyleSheet("""
@@ -763,28 +791,24 @@ class ModernScorebug(QFrame):
         self.pitcher_label.setText(f"P: {state['pitcher']}")
         self.batter_label.setText(f"AB: {state['batter']}")
 
-        # 5 Balls LED indicators
         for i, led in enumerate(self.ball_leds):
             if i < state["balls"]:
                 led.setStyleSheet("background-color: #38bdf8; border-radius: 5px;")
             else:
                 led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # 3 Strikes LED indicators
         for i, led in enumerate(self.strike_leds):
             if i < state["strikes"]:
                 led.setStyleSheet("background-color: #ef4444; border-radius: 5px;")
             else:
                 led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # 3 Outs LED indicators
         for i, led in enumerate(self.out_leds):
             if i < state["outs"]:
                 led.setStyleSheet("background-color: #f59e0b; border-radius: 5px;")
             else:
                 led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # Lob Phase Active Banner
         if state["is_lob_phase"]:
             self.lob_banner.setText(f"LOB {state['lob_count']}/{MAX_LOBS}")
             self.lob_banner.setVisible(True)
@@ -796,8 +820,6 @@ class ModernScorebug(QFrame):
 # Source Selection Modal
 # ---------------------------------------------------------------------------
 class SourceSelectionDialog(QDialog):
-    """Modal dialog for selecting Live Camera, Local Video File, or YouTube Stream."""
-
     source_selected = Signal(object, str)
 
     def __init__(self, parent=None):
@@ -941,21 +963,17 @@ class SourceSelectionDialog(QDialog):
 # Main Application Window
 # ---------------------------------------------------------------------------
 class BlitzballMainWindow(QMainWindow):
-    """Main Application Window for Blitzball Computer Vision System."""
-
     def __init__(self, initial_source: Optional[object] = None):
         super().__init__()
         self.setWindowTitle("Blitzball Pitch Tracker Pro")
-        self.resize(1300, 840)
+        self.resize(1320, 850)
         self.setStyleSheet(MODERN_STYLE_SHEET)
 
-        # Core Engines
         self.game = GameState()
         self.tracker: Optional[PitchTracker] = None
         self.logger = GameLogger()
         self.zone_polygon: Optional[np.ndarray] = None
         self.ball_color_mode: str = "auto"
-        self.corridor_expansion: float = 1.0
 
         self.video_thread: Optional[VideoThread] = None
         self.current_source: Optional[object] = initial_source
@@ -984,7 +1002,7 @@ class BlitzballMainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(8)
 
-        # Left Column: Video Viewport + Controls
+        # Left Column: Video Canvas + Toolbar
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -992,6 +1010,7 @@ class BlitzballMainWindow(QMainWindow):
 
         self.canvas = VideoCanvas()
         self.canvas.calibration_completed.connect(self._on_calibration_done)
+        self.canvas.color_sampled.connect(self._on_color_sampled)
         left_layout.addWidget(self.canvas, stretch=1)
 
         # Playback & Calibration Toolbar
@@ -1004,6 +1023,12 @@ class BlitzballMainWindow(QMainWindow):
         self.btn_calibrate = QPushButton("Calibrate Strike Zone")
         self.btn_calibrate.clicked.connect(self.canvas.start_calibration)
 
+        self.btn_sample_color = QPushButton("Sample Ball Color")
+        self.btn_sample_color.clicked.connect(self._start_sample_color)
+
+        self.chk_show_mask = QCheckBox("Show Vision Mask")
+        self.chk_show_mask.toggled.connect(self._toggle_show_mask)
+
         self.btn_source = QPushButton("Select Source")
         self.btn_source.clicked.connect(self.open_source_dialog)
 
@@ -1013,6 +1038,8 @@ class BlitzballMainWindow(QMainWindow):
 
         playback_bar.addWidget(self.btn_play_pause)
         playback_bar.addWidget(self.btn_calibrate)
+        playback_bar.addWidget(self.btn_sample_color)
+        playback_bar.addWidget(self.chk_show_mask)
         playback_bar.addWidget(self.btn_source)
         playback_bar.addWidget(self.timeline_slider, stretch=1)
 
@@ -1061,7 +1088,6 @@ class BlitzballMainWindow(QMainWindow):
         action_layout.addWidget(self.btn_lob_hit, 2, 1)
         deck_layout.addWidget(action_group)
 
-        # Score Adjustment Box
         runs_group = QGroupBox("Score Adjustments")
         runs_layout = QHBoxLayout(runs_group)
         btn_away_run = QPushButton("+1 Away Run")
@@ -1072,7 +1098,6 @@ class BlitzballMainWindow(QMainWindow):
         runs_layout.addWidget(btn_home_run)
         deck_layout.addWidget(runs_group)
 
-        # Live Pitch Log Table
         log_group = QGroupBox("Pitches Log")
         log_layout = QVBoxLayout(log_group)
         self.log_table = QTableWidget(0, 5)
@@ -1087,20 +1112,20 @@ class BlitzballMainWindow(QMainWindow):
         # Tab 2: Tracking & Detection Settings
         tracking_tab = QWidget()
         tracking_layout = QVBoxLayout(tracking_tab)
-        tracking_layout.setSpacing(12)
+        tracking_layout.setSpacing(10)
 
-        # Detection Engine Selector
+        # Engine Selector
         engine_group = QGroupBox("Pitch Detection Engine")
         engine_layout = QVBoxLayout(engine_group)
         self.engine_combo = QComboBox()
-        self.engine_combo.addItem("YOLOv8 AI Sports Ball Detector (Recommended)", True)
-        self.engine_combo.addItem("High-Speed Temporal CV Mode", False)
+        self.engine_combo.addItem("Chromatic Color + Motion Differencing (High Speed)", False)
+        self.engine_combo.addItem("YOLOv8 AI Sports Ball Detector (Neural)", True)
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
-        engine_layout.addWidget(QLabel("Active AI / CV Backend:"))
+        engine_layout.addWidget(QLabel("Active Vision Algorithm:"))
         engine_layout.addWidget(self.engine_combo)
         tracking_layout.addWidget(engine_group)
 
-        # Detection Sensitivity / Strictness Slider
+        # Sensitivity / Strictness Slider
         sens_group = QGroupBox("Detection Sensitivity & Strictness")
         sens_layout = QVBoxLayout(sens_group)
         sens_layout.addWidget(QLabel("Detection Sensitivity (Catch Rate vs Strictness):"))
@@ -1115,19 +1140,32 @@ class BlitzballMainWindow(QMainWindow):
         sens_layout.addWidget(self.sens_status_lbl)
         tracking_layout.addWidget(sens_group)
 
-        # Ball Color Selector
-        color_group = QGroupBox("Blitzball Color Detection")
+        # Color Preset & Sampler Box
+        color_group = QGroupBox("Blitzball Color Calibration & Distortion")
         color_layout = QVBoxLayout(color_group)
         self.color_combo = QComboBox()
-        self.color_combo.addItem("Auto (Neon Yellow/Green + Light Blue)", "auto")
+        self.color_combo.addItem("Auto (Chromatic Neon Green + Light Blue)", "auto")
         self.color_combo.addItem("Neon Yellow / Green Only", "neon_green")
         self.color_combo.addItem("Light Blue Only", "light_blue")
         self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
-        color_layout.addWidget(QLabel("Select Active Ball Color:"))
+        color_layout.addWidget(QLabel("Color Mode Presets:"))
         color_layout.addWidget(self.color_combo)
+
+        btn_sample = QPushButton("Sample Ball Color from Video (Click on Ball)")
+        btn_sample.clicked.connect(self._start_sample_color)
+        color_layout.addWidget(btn_sample)
+
+        self.color_status_lbl = QLabel("Active: Chromatic Amplification (2G-R-B & 2B-R-G)")
+        self.color_status_lbl.setStyleSheet("color: #10b981;")
+        color_layout.addWidget(self.color_status_lbl)
+
+        btn_reset_color = QPushButton("Reset to Default Blitzball Color Bounds")
+        btn_reset_color.clicked.connect(self._reset_color_bounds)
+        color_layout.addWidget(btn_reset_color)
+
         tracking_layout.addWidget(color_group)
 
-        # Detection Corridor / ROI Adjuster
+        # Pitch Corridor Slider
         roi_group = QGroupBox("Pitch Corridor Region (Ground Clutter Rejection)")
         roi_layout = QVBoxLayout(roi_group)
         roi_layout.addWidget(QLabel("Corridor Width Expansion:"))
@@ -1234,20 +1272,28 @@ class BlitzballMainWindow(QMainWindow):
                 [[220, 120], [420, 120], [420, 360], [220, 360]], dtype=np.int32
             )
             self.tracker = PitchTracker(
-                self.zone_polygon, color_mode=self.ball_color_mode
+                self.zone_polygon,
+                color_mode=self.ball_color_mode,
+                use_yolo=bool(self.engine_combo.currentData()),
+                sensitivity=self.sens_slider.value(),
             )
 
     @Slot(np.ndarray, float)
     def _on_frame_ready(self, frame: np.ndarray, timestamp: float):
         if self.tracker is None and self.zone_polygon is not None:
             self.tracker = PitchTracker(
-                self.zone_polygon, color_mode=self.ball_color_mode
+                self.zone_polygon,
+                color_mode=self.ball_color_mode,
+                use_yolo=bool(self.engine_combo.currentData()),
+                sensitivity=self.sens_slider.value(),
             )
 
         trajectory = []
         roi_box = None
+        diag_mask = None
+
         if self.tracker is not None:
-            centroid, mask = self.tracker.process_frame(frame, timestamp)
+            centroid, diag_mask = self.tracker.process_frame(frame, timestamp)
 
             if self.tracker.is_pitch_complete():
                 result = self.tracker.evaluate_pitch()
@@ -1259,7 +1305,29 @@ class BlitzballMainWindow(QMainWindow):
             roi_box = self.tracker.roi_box
             self.canvas.ball_radius = getattr(self.tracker, "current_ball_radius", 14)
 
-        self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box)
+        self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box, diag_mask)
+
+    def _start_sample_color(self):
+        if not self.is_paused:
+            self.toggle_playback()
+        self.canvas.start_color_sampling()
+
+    def _on_color_sampled(self, x: int, y: int):
+        if self.canvas.current_frame is not None and self.tracker is not None:
+            lower, upper = self.tracker.sample_color_at_pixel(self.canvas.current_frame, x, y)
+            self.color_status_lbl.setText(f"Custom Calibrated (H:{lower[0]}-{upper[0]}, S:{lower[1]}+)")
+            self.color_status_lbl.setStyleSheet("color: #38bdf8;")
+
+    def _reset_color_bounds(self):
+        if self.tracker is not None:
+            self.tracker.custom_hsv_lower = None
+            self.tracker.custom_hsv_upper = None
+            self.color_status_lbl.setText("Active: Chromatic Amplification (2G-R-B & 2B-R-G)")
+            self.color_status_lbl.setStyleSheet("color: #10b981;")
+
+    def _toggle_show_mask(self, checked: bool):
+        self.canvas.show_diagnostic_mask = checked
+        self.canvas.update()
 
     def _on_sensitivity_changed(self, value: int):
         if value >= 75:
@@ -1285,7 +1353,12 @@ class BlitzballMainWindow(QMainWindow):
         if self.tracker is not None:
             self.tracker.set_strike_zone(self.zone_polygon)
         else:
-            self.tracker = PitchTracker(self.zone_polygon, color_mode=self.ball_color_mode)
+            self.tracker = PitchTracker(
+                self.zone_polygon,
+                color_mode=self.ball_color_mode,
+                use_yolo=bool(self.engine_combo.currentData()),
+                sensitivity=self.sens_slider.value(),
+            )
         self._refresh_display()
 
     def _on_color_mode_changed(self):
@@ -1293,6 +1366,7 @@ class BlitzballMainWindow(QMainWindow):
         self.ball_color_mode = mode
         if self.tracker is not None:
             self.tracker.set_color_mode(mode)
+            self._reset_color_bounds()
 
     def _on_engine_changed(self):
         use_yolo = bool(self.engine_combo.currentData())
@@ -1305,8 +1379,8 @@ class BlitzballMainWindow(QMainWindow):
                     self.tracker.use_yolo = True
                 except Exception:
                     self.tracker.use_yolo = False
-                    QMessageBox.warning(self, "YOLO Unavailable", "YOLO model could not be loaded. Falling back to High-Speed CV mode.")
-                    self.engine_combo.setCurrentIndex(1)
+                    QMessageBox.warning(self, "YOLO Unavailable", "YOLO model could not be loaded. Falling back to Chromatic CV mode.")
+                    self.engine_combo.setCurrentIndex(0)
 
     def _on_roi_slider_changed(self, value: int):
         scale = value / 100.0
@@ -1318,9 +1392,9 @@ class BlitzballMainWindow(QMainWindow):
             w = max_x - min_x
             h = max_y - min_y
 
-            margin_x = int(w * 0.75 * scale)
-            margin_top = int(h * 1.5 * scale)
-            margin_bottom = int(h * 0.2)
+            margin_x = int(w * 1.0 * scale)
+            margin_top = int(h * 3.0 * scale)
+            margin_bottom = int(h * 0.25)
 
             rx1 = max(0, min_x - margin_x)
             ry1 = max(0, min_y - margin_top)
