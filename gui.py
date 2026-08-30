@@ -583,13 +583,32 @@ class VideoCanvas(QWidget):
             painter.setPen(QPen(QColor(250, 204, 21, 230), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
-            # Current ball position
+        # 4. Draw Hollow Ball Target Reticle (Hollow outline - does not cover the ball)
+        if self.trajectory:
             last_pt = to_widget(self.trajectory[-1][0], self.trajectory[-1][1])
-            painter.setBrush(QBrush(QColor("#ef4444")))
-            painter.setPen(QPen(QColor("#ffffff"), 2))
-            painter.drawEllipse(last_pt, 6, 6)
+            rad = getattr(self, "ball_radius", 14)
+            rad = max(10, min(36, int(rad * scale)))
 
-        # 4. Broadcast Call Alert Banner
+            # Transparent center (strictly no solid brush fill)
+            painter.setBrush(Qt.NoBrush)
+
+            # Outer soft glow ring
+            painter.setPen(QPen(QColor(56, 189, 248, 100), 5, Qt.SolidLine))
+            painter.drawEllipse(last_pt, rad + 2, rad + 2)
+
+            # Crisp neon green/cyan outline ring
+            painter.setPen(QPen(QColor(56, 189, 248, 240), 2.2, Qt.SolidLine))
+            painter.drawEllipse(last_pt, rad, rad)
+
+            # Corner target brackets
+            tick = max(4, int(rad * 0.4))
+            painter.setPen(QPen(QColor(56, 189, 248, 210), 1.6, Qt.SolidLine))
+            painter.drawLine(int(last_pt.x() - rad - tick), int(last_pt.y()), int(last_pt.x() - rad + 2), int(last_pt.y()))
+            painter.drawLine(int(last_pt.x() + rad - 2), int(last_pt.y()), int(last_pt.x() + rad + tick), int(last_pt.y()))
+            painter.drawLine(int(last_pt.x()), int(last_pt.y() - rad - tick), int(last_pt.x()), int(last_pt.y() - rad + 2))
+            painter.drawLine(int(last_pt.x()), int(last_pt.y() + rad - 2), int(last_pt.x()), int(last_pt.y() + rad + tick))
+
+        # 5. Broadcast Call Alert Banner
         if self.alert_opacity > 0.0 and self.alert_text:
             painter.setOpacity(self.alert_opacity)
             banner_rect = QRect(ox + 20, oy + 16, dw - 40, 44)
@@ -1081,6 +1100,21 @@ class BlitzballMainWindow(QMainWindow):
         engine_layout.addWidget(self.engine_combo)
         tracking_layout.addWidget(engine_group)
 
+        # Detection Sensitivity / Strictness Slider
+        sens_group = QGroupBox("Detection Sensitivity & Strictness")
+        sens_layout = QVBoxLayout(sens_group)
+        sens_layout.addWidget(QLabel("Detection Sensitivity (Catch Rate vs Strictness):"))
+        self.sens_slider = QSlider(Qt.Horizontal)
+        self.sens_slider.setRange(1, 100)
+        self.sens_slider.setValue(75)
+        self.sens_slider.valueChanged.connect(self._on_sensitivity_changed)
+        sens_layout.addWidget(self.sens_slider)
+
+        self.sens_status_lbl = QLabel("Sensitivity: 75% (High Catch Rate - Captures fast pitches & all arm angles)")
+        self.sens_status_lbl.setStyleSheet("color: #38bdf8;")
+        sens_layout.addWidget(self.sens_status_lbl)
+        tracking_layout.addWidget(sens_group)
+
         # Ball Color Selector
         color_group = QGroupBox("Blitzball Color Detection")
         color_layout = QVBoxLayout(color_group)
@@ -1223,8 +1257,25 @@ class BlitzballMainWindow(QMainWindow):
 
             trajectory = list(self.tracker.trajectory)
             roi_box = self.tracker.roi_box
+            self.canvas.ball_radius = getattr(self.tracker, "current_ball_radius", 14)
 
         self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box)
+
+    def _on_sensitivity_changed(self, value: int):
+        if value >= 75:
+            lbl = f"Sensitivity: {value}% (High Catch Rate - Captures fast pitches & all arm angles)"
+            color = "#38bdf8"
+        elif value >= 45:
+            lbl = f"Sensitivity: {value}% (Balanced Detection)"
+            color = "#10b981"
+        else:
+            lbl = f"Sensitivity: {value}% (Strict Filtering - High Confidence Only)"
+            color = "#f59e0b"
+
+        self.sens_status_lbl.setText(lbl)
+        self.sens_status_lbl.setStyleSheet(f"color: {color};")
+        if self.tracker is not None:
+            self.tracker.set_sensitivity(value)
 
     def _on_video_error(self, err_msg: str):
         QMessageBox.critical(self, "Video Error", f"Failed to process video:\n{err_msg}")
