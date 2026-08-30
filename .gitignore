@@ -3,6 +3,11 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Neural Network Weights & YOLO Runs
+*.pt
+*.onnx
+runs/
+
 # Environments & Virtual Envs
 .env
 .venv

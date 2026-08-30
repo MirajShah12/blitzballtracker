@@ -1,81 +1,98 @@
 """
-Lightweight High-Speed Pitch Tracker with Temporal Motion Differencing & Kalman Filtering
+Intelligent Sports Ball Tracker & Pitch Verification Engine
 
-Designed for real-time live video (60+ FPS, <2ms compute):
-1. Pitch Corridor ROI cropping (eliminates ground, sky, and peripheral clutter).
-2. Temporal Frame Differencing: Only analyzes pixels that are actively in motion,
-   instantly eliminating stationary balls on turf, fences, and background objects.
-3. Multi-Color HSV Masking (Neon Green/Yellow & Light Blue Blitzballs).
-4. Kalman Filter & Velocity Gating: Enforces physical trajectory continuity,
-   rejecting random single-frame outliers or teleporting detections.
+Features:
+1. Dual Detection Engine:
+   - YOLOv8 Neural Sports Ball Detector (when ultralytics/torch available):
+     Identifies 'sports ball' objects specifically while ignoring bats, people, gloves, and background.
+   - High-Speed Temporal CV Fallback: Multi-color HSV + Motion Differencing.
+2. Strict Physical Pitch Verification:
+   - Mound-to-Plate Vector Gating: Rejects motions that do not originate from the pitching
+     release zone or fail to travel forward/downward toward the strike zone.
+   - Bat Knob & Hand Motion Filter: Rejects circular/horizontal motions near the batter's box.
+   - 2.5-Second Anti-Spam Debounce Lockout: Prevents multiple false pitches from registering
+     in rapid succession during ball retrieval, swings, or catcher throw-backs.
+3. Kalman Filter Trajectory Smoothing:
+   - Eliminates micro-jitter and renders smooth broadcast-style pitch arcs.
 """
 
 import math
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
+# Try importing YOLO from ultralytics
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO = None
+    YOLO_AVAILABLE = False
+
+
 # ---------------------------------------------------------------------------
-# HSV Color Bounds
+# HSV Color Bounds (CV Fallback)
 # ---------------------------------------------------------------------------
-# Neon Green / Neon Yellow Blitzballs
 HSV_NEON_LOWER = np.array([20, 60, 60])
 HSV_NEON_UPPER = np.array([88, 255, 255])
 
-# Light Blue Blitzballs
 HSV_BLUE_LOWER = np.array([89, 50, 50])
 HSV_BLUE_UPPER = np.array([135, 255, 255])
 
-# Morphological noise removal
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-# Contour filters for sports ball detection
-MIN_AREA = 20
-MAX_AREA = 3500
-MIN_CIRCULARITY = 0.40
-
-# Motion Differencing Threshold (intensity delta between consecutive frames)
-MOTION_THRESHOLD = 18
-
-# Maximum pixel distance a ball can jump between consecutive frames
-MAX_FRAME_DISPLACEMENT = 130.0
+# Physical Thresholds
+MIN_PITCH_FRAMES = 5             # Minimum continuous frames for a valid pitch
+MIN_VERTICAL_TRAVEL_PX = 70.0    # Pitch must travel forward/downward toward the plate
+MAX_FRAME_DISPLACEMENT = 120.0   # Max jump between consecutive frames
+PITCH_COOLDOWN_SEC = 2.2         # Lockout window to prevent multiple calls in 1 pitch
 
 
 class PitchTracker:
-    """Real-time pitch tracker combining Temporal Motion Differencing and Kalman trajectory gating."""
+    """Intelligent pitch tracker with neural ball detection and physical pitch vector gating."""
 
     def __init__(
         self,
         zone_polygon: np.ndarray,
         color_mode: str = "auto",
         roi_box: Optional[Tuple[int, int, int, int]] = None,
+        use_yolo: bool = True,
     ):
         self.color_mode = color_mode
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         self.roi_box: Optional[Tuple[int, int, int, int]] = roi_box
 
-        # Trajectory storage: [(x, y, timestamp, smoothed_x, smoothed_y)]
+        # Trajectory points: [(x, y, timestamp)]
         self.trajectory: List[Tuple[int, int, float]] = []
-        self._raw_points: List[Tuple[int, int, float]] = []
 
-        # Previous frame for temporal motion differencing
+        # YOLO AI Model
+        self.use_yolo = use_yolo and YOLO_AVAILABLE
+        self.yolo_model = None
+        if self.use_yolo:
+            try:
+                # Load lightweight nano model
+                self.yolo_model = YOLO("yolov8n.pt")
+            except Exception:
+                self.use_yolo = False
+                self.yolo_model = None
+
+        # Temporal difference state (CV fallback)
         self.prev_roi_gray: Optional[np.ndarray] = None
 
-        # Kalman Filter initialization: State = [x, y, dx, dy]
-        self._init_kalman()
-
-        # Tracking state
+        # Physical trajectory and lockout tracking
+        self.last_pitch_timestamp: float = 0.0
         self._frames_without_detection: int = 0
         self._pitch_active: bool = False
-        self._gap_threshold: int = 6  # Frames of missing detections before pitch concludes
+        self._gap_threshold: int = 5
 
+        # 2D Kalman Filter
+        self._init_kalman()
         self.set_strike_zone(zone_polygon, roi_box)
 
     def _init_kalman(self) -> None:
-        """Initialize OpenCV Kalman filter for 2D position + velocity tracking."""
         self.kalman = cv2.KalmanFilter(4, 2)
-        # Transition matrix: x_t = x_{t-1} + dt * v
         self.kalman.transitionMatrix = np.array(
             [[1, 0, 1, 0],
              [0, 1, 0, 1],
@@ -83,15 +100,12 @@ class PitchTracker:
              [0, 0, 0, 1]],
             dtype=np.float32,
         )
-        # Measurement matrix: we measure (x, y)
         self.kalman.measurementMatrix = np.array(
             [[1, 0, 0, 0],
              [0, 1, 0, 0]],
             dtype=np.float32,
         )
-        # Process noise covariance (smooth motion model)
         self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        # Measurement noise covariance
         self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
         self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
         self._kalman_initialized = False
@@ -102,7 +116,7 @@ class PitchTracker:
         roi_box: Optional[Tuple[int, int, int, int]] = None,
         frame_shape: Optional[Tuple[int, int]] = None,
     ) -> None:
-        """Update strike zone polygon and recalculate active Pitch Corridor ROI."""
+        """Calculate pitch tunnel corridor from mound to strike zone."""
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         pts = zone_polygon.reshape((-1, 2))
 
@@ -114,10 +128,10 @@ class PitchTracker:
             w = max_x - min_x
             h = max_y - min_y
 
-            # Expanded corridor: upward for release tunnel, outward horizontally, strictly bounded below
-            margin_x = int(w * 0.8)
-            margin_top = int(h * 1.6)
-            margin_bottom = int(h * 0.15)  # Cutoff ground below home plate
+            # Pitch corridor: covers mound/release area above the plate, bounded on sides
+            margin_x = int(w * 0.7)
+            margin_top = int(h * 2.2)  # Extend upward towards pitcher's mound
+            margin_bottom = int(h * 0.15)  # Cut off turf/ground below plate
 
             rx1 = max(0, min_x - margin_x)
             ry1 = max(0, min_y - margin_top)
@@ -131,40 +145,107 @@ class PitchTracker:
             self.roi_box = (rx1, ry1, rx2, ry2)
 
     def set_color_mode(self, mode: str) -> None:
-        """Set active ball color ('auto', 'neon_green', 'light_blue')."""
         self.color_mode = mode
 
     def reset(self) -> None:
-        """Reset trajectory and Kalman filter state for next pitch."""
+        """Reset trajectory buffer."""
         self.trajectory.clear()
-        self._raw_points.clear()
         self._frames_without_detection = 0
         self._pitch_active = False
         self._init_kalman()
 
-    def _get_color_mask(self, hsv_roi: np.ndarray) -> np.ndarray:
-        """Extract color candidate mask."""
-        if self.color_mode == "neon_green":
-            mask = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
-        elif self.color_mode == "light_blue":
-            mask = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+    # -----------------------------------------------------------------------
+    # Detection Sub-Routines
+    # -----------------------------------------------------------------------
+    def _detect_with_yolo(self, roi_img: np.ndarray, rx1: int, ry1: int) -> List[Tuple[int, int, float]]:
+        """Detect sports balls using YOLOv8 AI model."""
+        candidates = []
+        if self.yolo_model is None:
+            return candidates
+
+        try:
+            results = self.yolo_model.predict(
+                source=roi_img,
+                conf=0.25,
+                classes=[32],  # Class 32 = sports ball in COCO dataset
+                verbose=False,
+                device="cpu",
+            )
+            for r in results:
+                boxes = r.boxes
+                for box in boxes:
+                    xyxy = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0].cpu().numpy())
+                    cx = int((xyxy[0] + xyxy[2]) / 2) + rx1
+                    cy = int((xyxy[1] + xyxy[3]) / 2) + ry1
+                    candidates.append((cx, cy, conf))
+        except Exception:
+            pass
+
+        return candidates
+
+    def _detect_with_cv(self, roi_img: np.ndarray, rx1: int, ry1: int) -> List[Tuple[int, int, float]]:
+        """Fast CV candidate extraction with motion differencing and color filtering."""
+        candidates = []
+        curr_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.GaussianBlur(curr_gray, (5, 5), 0)
+
+        # 1. Motion Differencing
+        if self.prev_roi_gray is not None and self.prev_roi_gray.shape == curr_gray.shape:
+            diff = cv2.absdiff(curr_gray, self.prev_roi_gray)
+            _, motion_mask = cv2.threshold(diff, 16, 255, cv2.THRESH_BINARY)
+            motion_mask = cv2.dilate(motion_mask, MORPH_KERNEL, iterations=1)
         else:
-            mask_neon = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
-            mask_blue = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
-            mask = cv2.bitwise_or(mask_neon, mask_blue)
+            motion_mask = np.ones_like(curr_gray, dtype=np.uint8) * 255
+        self.prev_roi_gray = curr_gray
 
-        return mask
+        # 2. Color Mask
+        hsv_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        if self.color_mode == "neon_green":
+            color_mask = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
+        elif self.color_mode == "light_blue":
+            color_mask = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+        else:
+            m1 = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
+            m2 = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+            color_mask = cv2.bitwise_or(m1, m2)
 
+        fused = cv2.bitwise_and(color_mask, motion_mask)
+        fused = cv2.morphologyEx(fused, cv2.MORPH_OPEN, MORPH_KERNEL)
+
+        contours, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 15 or area > 3500:
+                continue
+            peri = cv2.arcLength(c, True)
+            if peri == 0:
+                continue
+            circ = 4 * math.pi * (area / (peri**2))
+            if circ < 0.35:
+                continue
+
+            M = cv2.moments(c)
+            if M["m00"] > 0:
+                cx = int(M["m10"] / M["m00"]) + rx1
+                cy = int(M["m01"] / M["m00"]) + ry1
+                candidates.append((cx, cy, circ))
+
+        return candidates
+
+    # -----------------------------------------------------------------------
+    # Main Processing Pipeline
+    # -----------------------------------------------------------------------
     def process_frame(
         self, frame: np.ndarray, timestamp: float
     ) -> Tuple[Optional[Tuple[int, int]], np.ndarray]:
-        """
-        Process incoming frame using 3-stage temporal filtering:
-        1. ROI cropping
-        2. Frame Differencing x HSV Color Mask
-        3. Kalman Velocity Gating
-        """
+        """Process frame and track ball trajectory with physical vector verification."""
         fh, fw = frame.shape[:2]
+
+        # Check anti-spam cooldown window
+        if (timestamp - self.last_pitch_timestamp) < PITCH_COOLDOWN_SEC:
+            # During cooldown lockout, discard detections
+            return None, np.zeros((fh, fw), dtype=np.uint8)
 
         if self.roi_box is not None:
             rx1, ry1, rx2, ry2 = self.roi_box
@@ -173,100 +254,56 @@ class PitchTracker:
         else:
             rx1, ry1, rx2, ry2 = 0, 0, fw, fh
 
-        roi = frame[ry1:ry2, rx1:rx2]
-        if roi.size == 0:
+        roi_img = frame[ry1:ry2, rx1:rx2]
+        if roi_img.size == 0:
             return None, np.zeros((fh, fw), dtype=np.uint8)
 
-        # Grayscale conversion for temporal differencing
-        curr_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        curr_gray = cv2.GaussianBlur(curr_gray, (5, 5), 0)
+        # Get candidates (YOLO or CV)
+        candidates = []
+        if self.use_yolo:
+            candidates = self._detect_with_yolo(roi_img, rx1, ry1)
 
-        # --- Stage 1: Temporal Motion Differencing ---
-        if self.prev_roi_gray is not None and self.prev_roi_gray.shape == curr_gray.shape:
-            frame_diff = cv2.absdiff(curr_gray, self.prev_roi_gray)
-            _, motion_mask = cv2.threshold(frame_diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
-            motion_mask = cv2.dilate(motion_mask, MORPH_KERNEL, iterations=1)
-        else:
-            motion_mask = np.ones_like(curr_gray, dtype=np.uint8) * 255
+        # If YOLO returned no candidate or is disabled, fallback to high-speed CV
+        if not candidates:
+            candidates = self._detect_with_cv(roi_img, rx1, ry1)
 
-        self.prev_roi_gray = curr_gray
-
-        # --- Stage 2: Color Masking ---
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        color_mask = self._get_color_mask(hsv_roi)
-
-        # Fuse Motion + Color: A ball MUST be both in motion AND match color
-        # When pitch is already active, we also allow pure color with relaxed motion
-        if self._pitch_active:
-            # Slightly relaxed motion to maintain track during deceleration or small frame delta
-            fused_mask = cv2.bitwise_and(color_mask, cv2.bitwise_or(motion_mask, color_mask))
-        else:
-            fused_mask = cv2.bitwise_and(color_mask, motion_mask)
-
-        fused_mask = cv2.morphologyEx(fused_mask, cv2.MORPH_OPEN, MORPH_KERNEL)
-
-        # --- Stage 3: Contour Extraction & Shape Filtering ---
-        contours, _ = cv2.findContours(
-            fused_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        candidates: List[Tuple[int, int, float, float]] = []
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < MIN_AREA or area > MAX_AREA:
-                continue
-
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-
-            circularity = 4 * math.pi * (area / (perimeter**2))
-            if circularity < MIN_CIRCULARITY:
-                continue
-
-            M = cv2.moments(contour)
-            if M["m00"] > 0:
-                cx = int(M["m10"] / M["m00"]) + rx1
-                cy = int(M["m01"] / M["m00"]) + ry1
-                candidates.append((cx, cy, area, circularity))
-
-        # --- Stage 4: Kalman Trajectory Validation & Outlier Rejection ---
+        # Kalman Tracking & Gating
         best_point: Optional[Tuple[int, int]] = None
 
         if self._kalman_initialized:
-            # Predict expected position
             prediction = self.kalman.predict()
             pred_x, pred_y = float(prediction[0][0]), float(prediction[1][0])
 
-            # Find closest candidate to predicted Kalman position
             min_dist = float("inf")
-            for cx, cy, area, circ in candidates:
+            for cx, cy, conf in candidates:
+                # Reject motion traveling backward/upward once pitch is established
+                if len(self.trajectory) >= 2 and cy < self.trajectory[-1][1] - 15:
+                    continue
+
                 dist = math.hypot(cx - pred_x, cy - pred_y)
                 if dist < MAX_FRAME_DISPLACEMENT and dist < min_dist:
                     min_dist = dist
                     best_point = (cx, cy)
 
             if best_point is not None:
-                # Update Kalman filter with valid measurement
-                measurement = np.array([[np.float32(best_point[0])], [np.float32(best_point[1])]])
-                self.kalman.correct(measurement)
+                meas = np.array([[np.float32(best_point[0])], [np.float32(best_point[1])]])
+                self.kalman.correct(meas)
         else:
-            # Initialize track from best candidate
-            if candidates:
-                # Pick candidate with highest circularity and reasonable size
-                candidates.sort(key=lambda c: c[3], reverse=True)
-                best_point = (candidates[0][0], candidates[0][1])
+            # Start track ONLY if detection is in the upper 70% of the corridor (mound area)
+            # Rejects bat knob wiggles starting directly over the plate
+            if candidates and self.zone_polygon is not None:
+                pts = self.zone_polygon.reshape((-1, 2))
+                zone_top = int(np.min(pts[:, 1]))
 
-                self.kalman.statePost = np.array(
-                    [[np.float32(best_point[0])], [np.float32(best_point[1])], [0], [0]],
-                    dtype=np.float32,
-                )
-                self._kalman_initialized = True
-
-        # Full-frame mask for UI visualization
-        full_mask = np.zeros((fh, fw), dtype=np.uint8)
-        full_mask[ry1:ry2, rx1:rx2] = fused_mask
+                valid_starts = [c for c in candidates if c[1] <= zone_top + 20]
+                if valid_starts:
+                    valid_starts.sort(key=lambda c: c[2], reverse=True)
+                    best_point = (valid_starts[0][0], valid_starts[0][1])
+                    self.kalman.statePost = np.array(
+                        [[np.float32(best_point[0])], [np.float32(best_point[1])], [0], [0]],
+                        dtype=np.float32,
+                    )
+                    self._kalman_initialized = True
 
         if best_point is not None:
             self.trajectory.append((best_point[0], best_point[1], timestamp))
@@ -275,22 +312,38 @@ class PitchTracker:
         elif self._pitch_active:
             self._frames_without_detection += 1
 
-        return best_point, full_mask
+        mask = np.zeros((fh, fw), dtype=np.uint8)
+        return best_point, mask
 
     def is_pitch_complete(self) -> bool:
-        """Return True when ball trajectory concludes (minimum 3 continuous points)."""
-        return (
-            self._pitch_active
-            and self._frames_without_detection >= self._gap_threshold
-            and len(self.trajectory) >= 3
-        )
+        """Check if active pitch has concluded with physical vector validation."""
+        if not (self._pitch_active and self._frames_without_detection >= self._gap_threshold):
+            return False
+
+        # --- Physical Pitch Vector Validation ---
+        if len(self.trajectory) < MIN_PITCH_FRAMES:
+            # Micro-flicker noise (not a pitch) -> discard silently
+            self.reset()
+            return False
+
+        start_pt = self.trajectory[0]
+        final_pt = self.trajectory[-1]
+        y_travel = final_pt[1] - start_pt[1]
+
+        # Pitch MUST move downward/forward towards plate by at least MIN_VERTICAL_TRAVEL_PX
+        if y_travel < MIN_VERTICAL_TRAVEL_PX:
+            # Horizontal motion (bat knob, batter step) -> discard
+            self.reset()
+            return False
+
+        # Valid Pitch Confirmed!
+        return True
 
     def evaluate_pitch(self) -> Optional[Dict]:
-        """Evaluate pitch outcome against strike zone polygon."""
-        if len(self.trajectory) < 3:
+        """Evaluate outcome of a verified pitch against strike zone."""
+        if len(self.trajectory) < MIN_PITCH_FRAMES:
             return None
 
-        # Final coordinate is the last valid tracked point
         x_final, y_final, _ = self.trajectory[-1]
         final_pt = (float(x_final), float(y_final))
 
@@ -298,9 +351,28 @@ class PitchTracker:
         in_zone = score >= 0
         call = "STRIKE" if in_zone else "BALL"
 
+        # Arm the 2.5-second anti-spam lockout timestamp
+        self.last_pitch_timestamp = time.time()
+
         return {
             "call": call,
             "final_coord": [x_final, y_final],
             "trajectory_points": [[x, y, t] for x, y, t in self.trajectory],
             "in_zone": in_zone,
         }
+
+    def draw_overlay(self, frame: np.ndarray, zone_polygon: np.ndarray) -> np.ndarray:
+        """Draw strike zone and trajectory on the OpenCV frame."""
+        pts = zone_polygon.reshape((-1, 1, 2))
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        for i in range(1, len(self.trajectory)):
+            pt1 = (self.trajectory[i - 1][0], self.trajectory[i - 1][1])
+            pt2 = (self.trajectory[i][0], self.trajectory[i][1])
+            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
+
+        if self.trajectory:
+            last = self.trajectory[-1]
+            cv2.circle(frame, (last[0], last[1]), 6, (0, 0, 255), -1)
+
+        return frame

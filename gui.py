@@ -1070,6 +1070,17 @@ class BlitzballMainWindow(QMainWindow):
         tracking_layout = QVBoxLayout(tracking_tab)
         tracking_layout.setSpacing(12)
 
+        # Detection Engine Selector
+        engine_group = QGroupBox("Pitch Detection Engine")
+        engine_layout = QVBoxLayout(engine_group)
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("YOLOv8 AI Sports Ball Detector (Recommended)", True)
+        self.engine_combo.addItem("High-Speed Temporal CV Mode", False)
+        self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        engine_layout.addWidget(QLabel("Active AI / CV Backend:"))
+        engine_layout.addWidget(self.engine_combo)
+        tracking_layout.addWidget(engine_group)
+
         # Ball Color Selector
         color_group = QGroupBox("Blitzball Color Detection")
         color_layout = QVBoxLayout(color_group)
@@ -1231,6 +1242,20 @@ class BlitzballMainWindow(QMainWindow):
         self.ball_color_mode = mode
         if self.tracker is not None:
             self.tracker.set_color_mode(mode)
+
+    def _on_engine_changed(self):
+        use_yolo = bool(self.engine_combo.currentData())
+        if self.tracker is not None:
+            self.tracker.use_yolo = use_yolo
+            if use_yolo and self.tracker.yolo_model is None:
+                try:
+                    from ultralytics import YOLO
+                    self.tracker.yolo_model = YOLO("yolov8n.pt")
+                    self.tracker.use_yolo = True
+                except Exception:
+                    self.tracker.use_yolo = False
+                    QMessageBox.warning(self, "YOLO Unavailable", "YOLO model could not be loaded. Falling back to High-Speed CV mode.")
+                    self.engine_combo.setCurrentIndex(1)
 
     def _on_roi_slider_changed(self, value: int):
         scale = value / 100.0

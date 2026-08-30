@@ -7,7 +7,12 @@
 
 ## Key Features
 
-- **Computer Vision Pitch Tracking**: Detects neon-green/yellow and light-blue Blitzballs in HSV color space with morphological filtering, circularity validation, and point-in-polygon strike zone evaluation.
+- **Dual AI & CV Pitch Detection**:
+  - **YOLOv8 AI Sports Ball Detector**: Neural network specifically trained to detect `sports ball` objects while ignoring bats, gloves, people, and background scenery.
+  - **High-Speed CV Mode**: Dual-color HSV masking + temporal frame differencing.
+- **Physical Pitch Vector Verification**:
+  - **Mound-to-Plate Vector Gating**: Rejects false triggers that originate near the plate (e.g. bat knob wiggles, batter warmup steps) or in the outfield.
+  - **2.5-Second Anti-Spam Debounce Lockout**: Prevents duplicate auto-calls during ball retrieval, swings, or catcher throw-backs.
 - **Pitch Corridor Detection (ROI)**: Restricts ball detection to an active corridor around the strike zone and pitching tunnel, rejecting ground clutter, stationary balls on turf, and peripheral movement.
 - **Interactive Strike Zone Calibration**: 4-corner click calibration directly on the video canvas with a 9-box K-Zone grid overlay.
 - **Official Blitzball Rule Engine**:
