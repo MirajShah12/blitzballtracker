@@ -1,8 +1,13 @@
 """
-Blitzball Pitch Tracker & Game Engine - Modern Broadcast GUI (PySide6)
+Blitzball Pitch Tracker & Game Engine - Professional Broadcast Interface (PySide6)
 
-A broadcast-grade desktop interface for real-time Blitzball pitch tracking,
-automatic ball/strike detection, 5-ball walk & 2-lob rules, and live box scores.
+Features:
+- Clean, broadcast-grade sports analytics interface without clutter.
+- Multi-color Blitzball tracking (Neon Green/Yellow & Light Blue).
+- Restricted Pitch Corridor ROI with adjustable margin to eliminate ground noise.
+- Strike zone calibration and K-Zone 9-box visualization.
+- Official Blitzball 5-ball walk & 2-lob rules.
+- Live box scores and pitch logs.
 """
 
 import math
@@ -14,7 +19,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 from PySide6.QtCore import (
-    QMutex,
     QPoint,
     QPointF,
     QRect,
@@ -30,10 +34,8 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
-    QIcon,
     QImage,
     QKeySequence,
-    QLinearGradient,
     QPainter,
     QPainterPath,
     QPen,
@@ -44,13 +46,10 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
-    QGraphicsDropShadowEffect,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -61,12 +60,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
-    QScrollArea,
     QSlider,
     QSplitter,
-    QStackedWidget,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -75,19 +70,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from calibrator import calibrate_strike_zone
 from logger import GameLogger
 from state_machine import BALLS_FOR_WALK, MAX_LOBS, STRIKES_FOR_OUT, GameState
 from tracker import PitchTracker
 from video_source import (
     download_youtube_video,
     is_youtube_url,
-    open_source,
     scan_available_cameras,
 )
 
 # ---------------------------------------------------------------------------
-# Styling & Theme Definitions
+# Clean, Professional Dark Sports Theme
 # ---------------------------------------------------------------------------
 MODERN_STYLE_SHEET = """
 QMainWindow {
@@ -117,18 +110,18 @@ QScrollBar::handle:vertical:hover {
     background: #58a6ff;
 }
 
-/* Frames & Cards */
+/* Frames & Panels */
 .CardFrame {
     background-color: #161b22;
     border: 1px solid #30363d;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 12px;
 }
 
 .ScorebugCard {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #1a2234, stop:1 #0d131f);
-    border: 1px solid #3b82f6;
-    border-radius: 12px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #161f30, stop:1 #0e1420);
+    border: 1px solid #2563eb;
+    border-radius: 10px;
 }
 
 /* Buttons */
@@ -136,7 +129,7 @@ QPushButton {
     background-color: #21262d;
     border: 1px solid #30363d;
     border-radius: 6px;
-    padding: 8px 14px;
+    padding: 7px 14px;
     font-weight: 600;
     color: #f0f6fc;
 }
@@ -161,7 +154,7 @@ QPushButton#StrikeBtn {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #dc2626, stop:1 #b91c1c);
     border: 1px solid #ef4444;
     color: white;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: bold;
     padding: 10px;
 }
@@ -173,7 +166,7 @@ QPushButton#BallBtn {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #059669, stop:1 #047857);
     border: 1px solid #10b981;
     color: white;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: bold;
     padding: 10px;
 }
@@ -185,7 +178,7 @@ QPushButton#HitBtn {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #d97706, stop:1 #b45309);
     border: 1px solid #f59e0b;
     color: white;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: bold;
     padding: 10px;
 }
@@ -197,7 +190,7 @@ QPushButton#LobBtn {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c3aed, stop:1 #6d28d9);
     border: 1px solid #8b5cf6;
     color: white;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: bold;
     padding: 10px;
 }
@@ -209,7 +202,7 @@ QPushButton#LobBtn:hover {
 QTabWidget::pane {
     border: 1px solid #30363d;
     background-color: #161b22;
-    border-radius: 8px;
+    border-radius: 6px;
     top: -1px;
 }
 QTabBar::tab {
@@ -250,16 +243,31 @@ QHeaderView::section {
     border: 1px solid #21262d;
 }
 
-/* LineEdits & Sliders */
-QLineEdit {
+/* Inputs & Controls */
+QLineEdit, QComboBox, QTextEdit {
     background-color: #0d1117;
     border: 1px solid #30363d;
     border-radius: 6px;
     padding: 6px 10px;
     color: #f0f6fc;
 }
-QLineEdit:focus {
+QLineEdit:focus, QComboBox:focus, QTextEdit:focus {
     border-color: #58a6ff;
+}
+
+QGroupBox {
+    font-weight: bold;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 4px;
+    color: #8b949e;
 }
 
 QSlider::groove:horizontal {
@@ -280,19 +288,6 @@ QSlider::handle:horizontal {
     margin-bottom: -4px;
     border-radius: 7px;
 }
-
-QProgressBar {
-    background-color: #21262d;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    text-align: center;
-    color: white;
-    font-weight: bold;
-}
-QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #3b82f6, stop:1 #10b981);
-    border-radius: 5px;
-}
 """
 
 
@@ -300,7 +295,7 @@ QProgressBar::chunk {
 # Video Worker Thread
 # ---------------------------------------------------------------------------
 class VideoThread(QThread):
-    """Thread for non-blocking OpenCV frame capture."""
+    """Thread for steady video capture without freezing the UI."""
 
     frame_ready = Signal(np.ndarray, float)
     stream_finished = Signal()
@@ -320,8 +315,11 @@ class VideoThread(QThread):
         self.running = True
         try:
             if isinstance(self.source, int):
-                # Camera
-                self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(self.source)
+                self.cap = (
+                    cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+                    if os.name == "nt"
+                    else cv2.VideoCapture(self.source)
+                )
                 self.is_live = True
             else:
                 self.cap = cv2.VideoCapture(self.source)
@@ -347,12 +345,15 @@ class VideoThread(QThread):
 
                 if not ret:
                     if not self.is_live:
-                        # Loop video or notify finish
                         self.stream_finished.emit()
                     time.sleep(0.05)
                     continue
 
-                ts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 if not self.is_live else time.time()
+                ts = (
+                    self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                    if not self.is_live
+                    else time.time()
+                )
                 self.frame_ready.emit(frame, ts)
 
                 if not self.is_live:
@@ -381,12 +382,11 @@ class VideoThread(QThread):
 
 
 # ---------------------------------------------------------------------------
-# Interactive Video Viewport with Calibration Drawing
+# Interactive Video Canvas
 # ---------------------------------------------------------------------------
 class VideoCanvas(QWidget):
-    """Custom high-performance canvas for video display and 4-point strike zone calibration."""
+    """Video rendering canvas with strike zone, detection corridor, and trajectory."""
 
-    point_clicked = Signal(int, int)
     calibration_completed = Signal(list)
 
     def __init__(self, parent=None):
@@ -397,14 +397,15 @@ class VideoCanvas(QWidget):
 
         self.current_frame: Optional[np.ndarray] = None
         self.zone_polygon: Optional[np.ndarray] = None
+        self.roi_box: Optional[Tuple[int, int, int, int]] = None
         self.trajectory: List[Tuple[int, int, float]] = []
 
         # Calibration state
         self.is_calibrating: bool = False
         self.calibration_points: List[Tuple[int, int]] = []
-        self.hover_pos: Optional[QPoint] = None
+        self.show_corridor: bool = True
 
-        # Flash alert overlay ("STRIKE", "BALL", "WALK - 2 LOBS", "HIT")
+        # Call alert overlay
         self.alert_text: str = ""
         self.alert_color: QColor = QColor(255, 255, 255)
         self.alert_opacity: float = 0.0
@@ -416,16 +417,18 @@ class VideoCanvas(QWidget):
         frame: np.ndarray,
         trajectory: List[Tuple[int, int, float]],
         zone_polygon: Optional[np.ndarray],
+        roi_box: Optional[Tuple[int, int, int, int]] = None,
     ):
         self.current_frame = frame
         self.trajectory = trajectory
         self.zone_polygon = zone_polygon
+        self.roi_box = roi_box
         self.update()
 
     def start_calibration(self):
         self.is_calibrating = True
         self.calibration_points = []
-        self.trigger_alert("CALIBRATION MODE: Click Top-Left", QColor("#38bdf8"), duration_ms=2500)
+        self.trigger_alert("CALIBRATION: Click Top-Left Corner", QColor("#38bdf8"), duration_ms=2500)
         self.update()
 
     def cancel_calibration(self):
@@ -438,11 +441,8 @@ class VideoCanvas(QWidget):
             return
 
         if event.button() == Qt.LeftButton:
-            # Map widget coordinates to original frame coordinates
             fw, fh = self.current_frame.shape[1], self.current_frame.shape[0]
             ww, wh = self.width(), self.height()
-
-            # Preserve aspect ratio calculation
             scale = min(ww / fw, wh / fh)
             ox = (ww - fw * scale) / 2
             oy = (wh - fh * scale) / 2
@@ -458,19 +458,14 @@ class VideoCanvas(QWidget):
                 labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                 if len(self.calibration_points) < 4:
                     next_lbl = labels[len(self.calibration_points)]
-                    self.trigger_alert(f"Point {len(self.calibration_points)} placed. Click {next_lbl}", QColor("#38bdf8"), duration_ms=1800)
+                    self.trigger_alert(f"Click {next_lbl} Corner", QColor("#38bdf8"), duration_ms=1800)
                 else:
                     self.is_calibrating = False
                     self.zone_polygon = np.array(self.calibration_points, dtype=np.int32)
                     self.calibration_completed.emit(self.calibration_points)
-                    self.trigger_alert("STRIKE ZONE CALIBRATED!", QColor("#10b981"), duration_ms=2500)
+                    self.trigger_alert("Strike Zone Calibrated", QColor("#10b981"), duration_ms=2200)
 
                 self.update()
-
-    def mouseMoveEvent(self, event):
-        self.hover_pos = event.position().toPoint()
-        if self.is_calibrating:
-            self.update()
 
     def trigger_alert(self, text: str, color: QColor, duration_ms: int = 1500):
         self.alert_text = text
@@ -480,7 +475,7 @@ class VideoCanvas(QWidget):
         self.update()
 
     def _fade_alert(self):
-        self.alert_opacity -= 0.025
+        self.alert_opacity -= 0.03
         if self.alert_opacity <= 0.0:
             self.alert_opacity = 0.0
             self.alert_timer.stop()
@@ -492,10 +487,9 @@ class VideoCanvas(QWidget):
         painter.fillRect(self.rect(), QColor("#080c14"))
 
         if self.current_frame is None:
-            # Placeholder text
             painter.setPen(QColor("#64748b"))
-            painter.setFont(QFont("Segoe UI", 16, QFont.DemiBold))
-            painter.drawText(self.rect(), Qt.AlignCenter, "No Video Source Active\nSelect a Camera, File, or YouTube URL")
+            painter.setFont(QFont("Segoe UI", 15, QFont.DemiBold))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No Active Video Feed\nSelect a Camera Device, Video File, or YouTube URL")
             return
 
         fh, fw = self.current_frame.shape[:2]
@@ -511,42 +505,56 @@ class VideoCanvas(QWidget):
         pixmap = QPixmap.fromImage(qimg).scaled(dw, dh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         painter.drawPixmap(ox, oy, pixmap)
 
-        # Coordinate transformation helper: Frame (fx, fy) -> Widget (wx, wy)
         def to_widget(fx: float, fy: float) -> QPointF:
             return QPointF(ox + fx * scale, oy + fy * scale)
 
-        # Draw Strike Zone Polygon
-        poly_to_draw = self.calibration_points if self.is_calibrating else (self.zone_polygon if self.zone_polygon is not None else None)
+        # 1. Draw Pitch Detection Corridor (ROI bounding area)
+        if self.roi_box is not None and not self.is_calibrating and self.show_corridor:
+            rx1, ry1, rx2, ry2 = self.roi_box
+            p_top_left = to_widget(rx1, ry1)
+            p_bot_right = to_widget(rx2, ry2)
+            roi_rect = QRectF(p_top_left, p_bot_right)
+
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(56, 189, 248, 80), 1.5, Qt.DashLine))
+            painter.drawRect(roi_rect)
+
+            painter.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
+            painter.setPen(QColor(56, 189, 248, 140))
+            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Pitch Detection Corridor")
+
+        # 2. Draw Strike Zone Polygon & K-Zone Grid
+        poly_to_draw = (
+            self.calibration_points
+            if self.is_calibrating
+            else (self.zone_polygon if self.zone_polygon is not None else None)
+        )
 
         if poly_to_draw is not None and len(poly_to_draw) > 0:
             qpoly = QPolygon([to_widget(p[0], p[1]).toPoint() for p in poly_to_draw])
 
             if len(poly_to_draw) == 4 and not self.is_calibrating:
-                # Semi-transparent 3D Strike Zone Overlay
-                painter.setBrush(QBrush(QColor(16, 185, 129, 45)))  # Emerald fill
-                painter.setPen(QPen(QColor(16, 185, 129, 230), 2.5, Qt.SolidLine))
+                painter.setBrush(QBrush(QColor(16, 185, 129, 45)))
+                painter.setPen(QPen(QColor(16, 185, 129, 220), 2.2, Qt.SolidLine))
                 painter.drawPolygon(qpoly)
 
-                # Draw strike zone internal crosshair grid (9-box MLB/K-Zone style)
+                # 9-box K-Zone Grid lines
                 p0 = to_widget(poly_to_draw[0][0], poly_to_draw[0][1])
                 p1 = to_widget(poly_to_draw[1][0], poly_to_draw[1][1])
                 p2 = to_widget(poly_to_draw[2][0], poly_to_draw[2][1])
                 p3 = to_widget(poly_to_draw[3][0], poly_to_draw[3][1])
 
-                painter.setPen(QPen(QColor(16, 185, 129, 100), 1, Qt.DashLine))
-                # Horizontal dividing lines
+                painter.setPen(QPen(QColor(16, 185, 129, 90), 1, Qt.DashLine))
                 for t in [1 / 3, 2 / 3]:
                     left = QPointF(p0.x() + (p3.x() - p0.x()) * t, p0.y() + (p3.y() - p0.y()) * t)
                     right = QPointF(p1.x() + (p2.x() - p1.x()) * t, p1.y() + (p2.y() - p1.y()) * t)
                     painter.drawLine(left, right)
-                # Vertical dividing lines
                 for t in [1 / 3, 2 / 3]:
                     top = QPointF(p0.x() + (p1.x() - p0.x()) * t, p0.y() + (p1.y() - p0.y()) * t)
                     bot = QPointF(p3.x() + (p2.x() - p3.x()) * t, p3.y() + (p2.y() - p3.y()) * t)
                     painter.drawLine(top, bot)
 
             elif self.is_calibrating:
-                # Draw calibration lines & vertices in cyan
                 painter.setPen(QPen(QColor("#38bdf8"), 2, Qt.SolidLine))
                 for i in range(len(poly_to_draw)):
                     pt = to_widget(poly_to_draw[i][0], poly_to_draw[i][1])
@@ -556,7 +564,7 @@ class VideoCanvas(QWidget):
                         prev = to_widget(poly_to_draw[i - 1][0], poly_to_draw[i - 1][1])
                         painter.drawLine(prev, pt)
 
-        # Draw Ball Trajectory Tail with Glow
+        # 3. Draw Pitch Trajectory Trail
         if len(self.trajectory) >= 2:
             path = QPainterPath()
             start = to_widget(self.trajectory[0][0], self.trajectory[0][1])
@@ -568,77 +576,77 @@ class VideoCanvas(QWidget):
 
             # Outer glow
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(234, 179, 8, 90), 8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            painter.setPen(QPen(QColor(234, 179, 8, 80), 7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
-            # Core trajectory line
-            painter.setPen(QPen(QColor(250, 204, 21, 240), 3, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+            # Core line
+            painter.setPen(QPen(QColor(250, 204, 21, 230), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
-            # Draw glowing ball head
+            # Current ball position
             last_pt = to_widget(self.trajectory[-1][0], self.trajectory[-1][1])
             painter.setBrush(QBrush(QColor("#ef4444")))
             painter.setPen(QPen(QColor("#ffffff"), 2))
-            painter.drawEllipse(last_pt, 7, 7)
+            painter.drawEllipse(last_pt, 6, 6)
 
-        # Draw Broadcast Call Alert Badge
+        # 4. Broadcast Call Alert Banner
         if self.alert_opacity > 0.0 and self.alert_text:
             painter.setOpacity(self.alert_opacity)
-            banner_rect = QRect(ox + 20, oy + 20, dw - 40, 50)
-            painter.setBrush(QBrush(QColor(15, 23, 42, 220)))
+            banner_rect = QRect(ox + 20, oy + 16, dw - 40, 44)
+            painter.setBrush(QBrush(QColor(15, 23, 42, 230)))
             painter.setPen(QPen(self.alert_color, 2))
-            painter.drawRoundedRect(banner_rect, 10, 10)
+            painter.drawRoundedRect(banner_rect, 8, 8)
 
             painter.setPen(self.alert_color)
-            painter.setFont(QFont("Segoe UI", 16, QFont.Bold))
+            painter.setFont(QFont("Segoe UI", 15, QFont.Bold))
             painter.drawText(banner_rect, Qt.AlignCenter, self.alert_text)
             painter.setOpacity(1.0)
 
 
 # ---------------------------------------------------------------------------
-# Modern Scorebug / Header Widget
+# Scorebug Header
 # ---------------------------------------------------------------------------
 class ModernScorebug(QFrame):
-    """Broadcast scorebug with Inning, Home/Away scores, Balls, Strikes, Outs LEDs, and LOB status."""
+    """Clean broadcast scorebug header with Inning, Score, Balls, Strikes, Outs, and Lob Status."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("ScorebugCard")
-        self.setFixedHeight(90)
+        self.setFixedHeight(84)
         self.setStyleSheet("""
             QFrame#ScorebugCard {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #111827, stop:1 #1f2937);
                 border: 1px solid #374151;
-                border-radius: 12px;
+                border-radius: 10px;
             }
         """)
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(20)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(18)
 
-        # Inning Box
+        # Inning Badge
         self.inning_label = QLabel("TOP 1")
-        self.inning_label.setFont(QFont("Segoe UI", 16, QFont.Black))
-        self.inning_label.setStyleSheet("color: #38bdf8; background: #0f172a; padding: 8px 14px; border-radius: 8px; border: 1px solid #0284c7;")
+        self.inning_label.setFont(QFont("Segoe UI", 15, QFont.Black))
+        self.inning_label.setStyleSheet("color: #38bdf8; background: #0f172a; padding: 7px 12px; border-radius: 6px; border: 1px solid #0284c7;")
         layout.addWidget(self.inning_label)
 
-        # Score Area: AWAY vs HOME
+        # Team Scores: AWAY vs HOME
         score_layout = QHBoxLayout()
         self.away_name = QLabel("AWAY")
         self.away_name.setFont(QFont("Segoe UI", 13, QFont.Bold))
         self.away_name.setStyleSheet("color: #94a3b8;")
 
         self.away_score = QLabel("0")
-        self.away_score.setFont(QFont("Segoe UI", 22, QFont.Black))
+        self.away_score.setFont(QFont("Segoe UI", 20, QFont.Black))
         self.away_score.setStyleSheet("color: #f8fafc;")
 
         divider = QLabel("-")
-        divider.setFont(QFont("Segoe UI", 20, QFont.Bold))
+        divider.setFont(QFont("Segoe UI", 18, QFont.Bold))
         divider.setStyleSheet("color: #64748b;")
 
         self.home_score = QLabel("0")
-        self.home_score.setFont(QFont("Segoe UI", 22, QFont.Black))
+        self.home_score.setFont(QFont("Segoe UI", 20, QFont.Black))
         self.home_score.setStyleSheet("color: #f8fafc;")
 
         self.home_name = QLabel("HOME")
@@ -652,7 +660,7 @@ class ModernScorebug(QFrame):
         score_layout.addWidget(self.home_name)
         layout.addLayout(score_layout)
 
-        # Matchup Info: Active Pitcher & Batter
+        # Matchup Info
         matchup_layout = QVBoxLayout()
         self.pitcher_label = QLabel("P: Pitcher 1")
         self.pitcher_label.setFont(QFont("Segoe UI", 12, QFont.DemiBold))
@@ -668,65 +676,62 @@ class ModernScorebug(QFrame):
 
         layout.addStretch()
 
-        # Count & Outs LED Matrix
+        # Count & Outs LED Matrix (5 Balls, 3 Strikes, 3 Outs)
         self.count_container = QWidget()
         count_layout = QGridLayout(self.count_container)
         count_layout.setContentsMargins(0, 0, 0, 0)
-        count_layout.setHorizontalSpacing(10)
+        count_layout.setHorizontalSpacing(8)
         count_layout.setVerticalSpacing(4)
 
-        # Balls (5 LEDs for 5-ball walk rule)
         b_label = QLabel("B")
-        b_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        b_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         b_label.setStyleSheet("color: #38bdf8;")
         count_layout.addWidget(b_label, 0, 0)
 
         self.ball_leds = []
         for i in range(BALLS_FOR_WALK):
             led = QLabel()
-            led.setFixedSize(12, 12)
-            led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+            led.setFixedSize(11, 11)
+            led.setStyleSheet("background-color: #334155; border-radius: 5px;")
             self.ball_leds.append(led)
             count_layout.addWidget(led, 0, i + 1)
 
-        # Strikes (3 LEDs)
         s_label = QLabel("S")
-        s_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        s_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         s_label.setStyleSheet("color: #ef4444;")
         count_layout.addWidget(s_label, 1, 0)
 
         self.strike_leds = []
         for i in range(STRIKES_FOR_OUT):
             led = QLabel()
-            led.setFixedSize(12, 12)
-            led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+            led.setFixedSize(11, 11)
+            led.setStyleSheet("background-color: #334155; border-radius: 5px;")
             self.strike_leds.append(led)
             count_layout.addWidget(led, 1, i + 1)
 
-        # Outs (3 LEDs)
         o_label = QLabel("O")
-        o_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        o_label.setFont(QFont("Segoe UI", 10, QFont.Bold))
         o_label.setStyleSheet("color: #f59e0b;")
         count_layout.addWidget(o_label, 2, 0)
 
         self.out_leds = []
         for i in range(3):
             led = QLabel()
-            led.setFixedSize(12, 12)
-            led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+            led.setFixedSize(11, 11)
+            led.setStyleSheet("background-color: #334155; border-radius: 5px;")
             self.out_leds.append(led)
             count_layout.addWidget(led, 2, i + 1)
 
         layout.addWidget(self.count_container)
 
-        # Lob Banner Badge (Displayed when 5 Balls reached)
+        # 2 Lobs Phase Badge
         self.lob_banner = QLabel("2 LOBS ACTIVE")
-        self.lob_banner.setFont(QFont("Segoe UI", 12, QFont.Black))
+        self.lob_banner.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.lob_banner.setStyleSheet("""
             color: #ffffff;
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8b5cf6, stop:1 #ec4899);
-            padding: 8px 14px;
-            border-radius: 8px;
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c3aed, stop:1 #db2777);
+            padding: 6px 12px;
+            border-radius: 6px;
             border: 1px solid #f472b6;
         """)
         self.lob_banner.setVisible(False)
@@ -739,28 +744,28 @@ class ModernScorebug(QFrame):
         self.pitcher_label.setText(f"P: {state['pitcher']}")
         self.batter_label.setText(f"AB: {state['batter']}")
 
-        # Update Balls LEDs (0-5)
+        # 5 Balls LED indicators
         for i, led in enumerate(self.ball_leds):
             if i < state["balls"]:
-                led.setStyleSheet("background-color: #38bdf8; border-radius: 6px; box-shadow: 0 0 6px #38bdf8;")
+                led.setStyleSheet("background-color: #38bdf8; border-radius: 5px;")
             else:
-                led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+                led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # Update Strikes LEDs (0-3)
+        # 3 Strikes LED indicators
         for i, led in enumerate(self.strike_leds):
             if i < state["strikes"]:
-                led.setStyleSheet("background-color: #ef4444; border-radius: 6px; box-shadow: 0 0 6px #ef4444;")
+                led.setStyleSheet("background-color: #ef4444; border-radius: 5px;")
             else:
-                led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+                led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # Update Outs LEDs (0-3)
+        # 3 Outs LED indicators
         for i, led in enumerate(self.out_leds):
             if i < state["outs"]:
-                led.setStyleSheet("background-color: #f59e0b; border-radius: 6px; box-shadow: 0 0 6px #f59e0b;")
+                led.setStyleSheet("background-color: #f59e0b; border-radius: 5px;")
             else:
-                led.setStyleSheet("background-color: #334155; border-radius: 6px;")
+                led.setStyleSheet("background-color: #334155; border-radius: 5px;")
 
-        # Lob Phase indicator
+        # Lob Phase Active Banner
         if state["is_lob_phase"]:
             self.lob_banner.setText(f"LOB {state['lob_count']}/{MAX_LOBS}")
             self.lob_banner.setVisible(True)
@@ -769,44 +774,43 @@ class ModernScorebug(QFrame):
 
 
 # ---------------------------------------------------------------------------
-# YouTube & Source Selection Dialog
+# Source Selection Modal
 # ---------------------------------------------------------------------------
 class SourceSelectionDialog(QDialog):
-    """Modal dialog to select Live Camera, Local Video File, or YouTube Stream/Download."""
+    """Modal dialog for selecting Live Camera, Local Video File, or YouTube Stream."""
 
     source_selected = Signal(object, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Select Blitzball Source")
-        self.setFixedSize(540, 420)
+        self.setWindowTitle("Select Video Input Source")
+        self.setFixedSize(520, 390)
         self.setStyleSheet(MODERN_STYLE_SHEET)
 
         layout = QVBoxLayout(self)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
 
-        title = QLabel("Select Input Feed")
-        title.setFont(QFont("Segoe UI", 16, QFont.Bold))
+        title = QLabel("Video Feed Selection")
+        title.setFont(QFont("Segoe UI", 15, QFont.Bold))
         layout.addWidget(title)
 
-        subtitle = QLabel("Choose live webcam for match play, or test with files and YouTube.")
+        subtitle = QLabel("Select live camera for match tracking, or test with a video file / YouTube link.")
         subtitle.setStyleSheet("color: #94a3b8;")
         layout.addWidget(subtitle)
 
-        # Tab Widget for 3 Source Modes
         tabs = QTabWidget()
 
         # 1. Live Camera Tab
         cam_tab = QWidget()
         cam_layout = QVBoxLayout(cam_tab)
         cam_layout.setSpacing(12)
-        cam_label = QLabel("Detected Camera Devices:")
+        cam_label = QLabel("Connected Camera Devices:")
         self.cam_combo = QComboBox()
         cameras = scan_available_cameras()
         for c in cameras:
             self.cam_combo.addItem(f"Camera Device {c}", c)
 
-        cam_btn = QPushButton("Launch Live Camera Feed")
+        cam_btn = QPushButton("Open Camera Feed")
         cam_btn.setObjectName("PrimaryBtn")
         cam_btn.clicked.connect(self._select_camera)
 
@@ -814,15 +818,15 @@ class SourceSelectionDialog(QDialog):
         cam_layout.addWidget(self.cam_combo)
         cam_layout.addStretch()
         cam_layout.addWidget(cam_btn)
-        tabs.addTab(cam_tab, "📹 Live Camera")
+        tabs.addTab(cam_tab, "Live Camera")
 
         # 2. Local File Tab
         file_tab = QWidget()
         file_layout = QVBoxLayout(file_tab)
         file_layout.setSpacing(12)
-        file_label = QLabel("Select Recorded Blitzball Video (.mp4, .mov, .avi):")
+        file_label = QLabel("Select Recorded Video File (.mp4, .mov, .avi):")
         self.file_path_edit = QLineEdit()
-        self.file_path_edit.setPlaceholderText("C:/path/to/blitzball_game.mp4")
+        self.file_path_edit.setPlaceholderText("C:/path/to/gameplay.mp4")
 
         browse_btn = QPushButton("Browse Files...")
         browse_btn.clicked.connect(self._browse_file)
@@ -836,13 +840,13 @@ class SourceSelectionDialog(QDialog):
         file_layout.addWidget(browse_btn)
         file_layout.addStretch()
         file_layout.addWidget(file_btn)
-        tabs.addTab(file_tab, "📁 Video File")
+        tabs.addTab(file_tab, "Video File")
 
         # 3. YouTube URL Tab
         yt_tab = QWidget()
         yt_layout = QVBoxLayout(yt_tab)
         yt_layout.setSpacing(10)
-        yt_label = QLabel("Paste YouTube Video URL:")
+        yt_label = QLabel("YouTube Video URL:")
         self.yt_edit = QLineEdit()
         self.yt_edit.setPlaceholderText("https://www.youtube.com/watch?v=...")
 
@@ -853,7 +857,7 @@ class SourceSelectionDialog(QDialog):
         self.yt_progress.setValue(0)
         self.yt_progress.setVisible(False)
 
-        self.yt_btn = QPushButton("Fetch & Stream YouTube Video")
+        self.yt_btn = QPushButton("Fetch & Stream Video")
         self.yt_btn.setObjectName("PrimaryBtn")
         self.yt_btn.clicked.connect(self._fetch_youtube)
 
@@ -863,7 +867,7 @@ class SourceSelectionDialog(QDialog):
         yt_layout.addWidget(self.yt_progress)
         yt_layout.addStretch()
         yt_layout.addWidget(self.yt_btn)
-        tabs.addTab(yt_tab, "🌐 YouTube")
+        tabs.addTab(yt_tab, "YouTube URL")
 
         layout.addWidget(tabs)
 
@@ -873,7 +877,9 @@ class SourceSelectionDialog(QDialog):
         self.accept()
 
     def _browse_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Video File", "", "Video Files (*.mp4 *.mov *.avi *.mkv)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Video File", "", "Video Files (*.mp4 *.mov *.avi *.mkv)"
+        )
         if path:
             self.file_path_edit.setText(path)
 
@@ -894,7 +900,7 @@ class SourceSelectionDialog(QDialog):
         self.yt_btn.setEnabled(False)
         self.yt_progress.setVisible(True)
         self.yt_progress.setValue(10)
-        self.yt_status.setText("Connecting to YouTube stream...")
+        self.yt_status.setText("Connecting to stream...")
         QApplication.processEvents()
 
         def _update_prog(pct, msg):
@@ -909,19 +915,19 @@ class SourceSelectionDialog(QDialog):
         except Exception as e:
             self.yt_btn.setEnabled(True)
             self.yt_status.setText(f"Error: {str(e)}")
-            QMessageBox.critical(self, "YouTube Stream Error", f"Failed to download YouTube video:\n{str(e)}")
+            QMessageBox.critical(self, "Stream Error", f"Failed to download YouTube video:\n{str(e)}")
 
 
 # ---------------------------------------------------------------------------
-# Main Broadcast Application Window
+# Main Application Window
 # ---------------------------------------------------------------------------
 class BlitzballMainWindow(QMainWindow):
     """Main Application Window for Blitzball Computer Vision System."""
 
     def __init__(self, initial_source: Optional[object] = None):
         super().__init__()
-        self.setWindowTitle("Blitzball Pitch Tracker Pro - AI Computer Vision & Umpire Suite")
-        self.resize(1340, 860)
+        self.setWindowTitle("Blitzball Pitch Tracker Pro")
+        self.resize(1300, 840)
         self.setStyleSheet(MODERN_STYLE_SHEET)
 
         # Core Engines
@@ -929,6 +935,8 @@ class BlitzballMainWindow(QMainWindow):
         self.tracker: Optional[PitchTracker] = None
         self.logger = GameLogger()
         self.zone_polygon: Optional[np.ndarray] = None
+        self.ball_color_mode: str = "auto"
+        self.corridor_expansion: float = 1.0
 
         self.video_thread: Optional[VideoThread] = None
         self.current_source: Optional[object] = initial_source
@@ -946,18 +954,18 @@ class BlitzballMainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(12)
+        main_layout.setContentsMargins(12, 10, 12, 10)
+        main_layout.setSpacing(10)
 
-        # 1. Top Broadcast Scorebug
+        # 1. Top Scorebug
         self.scorebug = ModernScorebug()
         main_layout.addWidget(self.scorebug)
 
-        # 2. Middle Splitter: Left (Video + Controls), Right (Tactile Deck + Stats)
+        # 2. Main Horizontal Splitter
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(8)
 
-        # Left Column: Video Viewport & Playback
+        # Left Column: Video Viewport + Controls
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -967,17 +975,17 @@ class BlitzballMainWindow(QMainWindow):
         self.canvas.calibration_completed.connect(self._on_calibration_done)
         left_layout.addWidget(self.canvas, stretch=1)
 
-        # Playback & Calibrate Toolbar
+        # Playback & Calibration Toolbar
         playback_bar = QHBoxLayout()
-        playback_bar.setSpacing(10)
+        playback_bar.setSpacing(8)
 
-        self.btn_play_pause = QPushButton("⏸ Pause")
+        self.btn_play_pause = QPushButton("Pause")
         self.btn_play_pause.clicked.connect(self.toggle_playback)
 
-        self.btn_calibrate = QPushButton("🎯 Calibrate Strike Zone")
+        self.btn_calibrate = QPushButton("Calibrate Strike Zone")
         self.btn_calibrate.clicked.connect(self.canvas.start_calibration)
 
-        self.btn_source = QPushButton("🔄 Change Source")
+        self.btn_source = QPushButton("Select Source")
         self.btn_source.clicked.connect(self.open_source_dialog)
 
         self.timeline_slider = QSlider(Qt.Horizontal)
@@ -992,38 +1000,37 @@ class BlitzballMainWindow(QMainWindow):
         left_layout.addLayout(playback_bar)
         splitter.addWidget(left_container)
 
-        # Right Column: Tabbed Control Deck (Tactile Manual Override, Lineups, Pitch Log, CV Settings)
+        # Right Column: Umpire Deck & Settings Tabs
         right_tabs = QTabWidget()
 
-        # Tab 1: Umpire Deck & Overrides
+        # Tab 1: Umpire Deck
         deck_tab = QWidget()
         deck_layout = QVBoxLayout(deck_tab)
-        deck_layout.setSpacing(12)
+        deck_layout.setSpacing(10)
 
-        # Big Call Buttons
-        action_group = QGroupBox("One-Click Umpire Actions")
+        action_group = QGroupBox("Umpire Actions")
         action_layout = QGridLayout(action_group)
-        action_layout.setSpacing(10)
+        action_layout.setSpacing(8)
 
-        self.btn_strike = QPushButton("⚡ Strike [S]")
+        self.btn_strike = QPushButton("Strike [S]")
         self.btn_strike.setObjectName("StrikeBtn")
         self.btn_strike.clicked.connect(self.manual_strike)
 
-        self.btn_ball = QPushButton("⚾ Ball [B]")
+        self.btn_ball = QPushButton("Ball [B]")
         self.btn_ball.setObjectName("BallBtn")
         self.btn_ball.clicked.connect(self.manual_ball)
 
-        self.btn_hit = QPushButton("💥 Hit [H]")
+        self.btn_hit = QPushButton("Base Hit [H]")
         self.btn_hit.setObjectName("HitBtn")
         self.btn_hit.clicked.connect(self.manual_hit)
 
-        self.btn_foul = QPushButton("🛡️ Foul [F]")
+        self.btn_foul = QPushButton("Foul Ball [F]")
         self.btn_foul.clicked.connect(self.manual_foul)
 
-        self.btn_out = QPushButton("🛑 In-Play Out [O]")
+        self.btn_out = QPushButton("In-Play Out [O]")
         self.btn_out.clicked.connect(self.manual_out)
 
-        self.btn_lob_hit = QPushButton("🎯 Lob Hit [L]")
+        self.btn_lob_hit = QPushButton("Lob Hit [L]")
         self.btn_lob_hit.setObjectName("LobBtn")
         self.btn_lob_hit.clicked.connect(self.manual_lob_hit)
 
@@ -1035,7 +1042,7 @@ class BlitzballMainWindow(QMainWindow):
         action_layout.addWidget(self.btn_lob_hit, 2, 1)
         deck_layout.addWidget(action_group)
 
-        # Runs score modifiers
+        # Score Adjustment Box
         runs_group = QGroupBox("Score Adjustments")
         runs_layout = QHBoxLayout(runs_group)
         btn_away_run = QPushButton("+1 Away Run")
@@ -1047,7 +1054,7 @@ class BlitzballMainWindow(QMainWindow):
         deck_layout.addWidget(runs_group)
 
         # Live Pitch Log Table
-        log_group = QGroupBox("Live Pitches Log")
+        log_group = QGroupBox("Pitches Log")
         log_layout = QVBoxLayout(log_group)
         self.log_table = QTableWidget(0, 5)
         self.log_table.setHorizontalHeaderLabels(["#", "Pitcher", "Batter", "Call", "Zone"])
@@ -1056,16 +1063,54 @@ class BlitzballMainWindow(QMainWindow):
         log_layout.addWidget(self.log_table)
         deck_layout.addWidget(log_group, stretch=1)
 
-        right_tabs.addTab(deck_tab, "🎮 Umpire Deck")
+        right_tabs.addTab(deck_tab, "Umpire Deck")
 
-        # Tab 2: Lineups & Rosters
+        # Tab 2: Tracking & Detection Settings
+        tracking_tab = QWidget()
+        tracking_layout = QVBoxLayout(tracking_tab)
+        tracking_layout.setSpacing(12)
+
+        # Ball Color Selector
+        color_group = QGroupBox("Blitzball Color Detection")
+        color_layout = QVBoxLayout(color_group)
+        self.color_combo = QComboBox()
+        self.color_combo.addItem("Auto (Neon Yellow/Green + Light Blue)", "auto")
+        self.color_combo.addItem("Neon Yellow / Green Only", "neon_green")
+        self.color_combo.addItem("Light Blue Only", "light_blue")
+        self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
+        color_layout.addWidget(QLabel("Select Active Ball Color:"))
+        color_layout.addWidget(self.color_combo)
+        tracking_layout.addWidget(color_group)
+
+        # Detection Corridor / ROI Adjuster
+        roi_group = QGroupBox("Pitch Corridor Region (Ground Clutter Rejection)")
+        roi_layout = QVBoxLayout(roi_group)
+        roi_layout.addWidget(QLabel("Corridor Width Expansion:"))
+        self.roi_slider = QSlider(Qt.Horizontal)
+        self.roi_slider.setRange(50, 200)
+        self.roi_slider.setValue(100)
+        self.roi_slider.valueChanged.connect(self._on_roi_slider_changed)
+        roi_layout.addWidget(self.roi_slider)
+
+        self.roi_status_lbl = QLabel("Width: 100% (Filters ground & sideline clutter)")
+        self.roi_status_lbl.setStyleSheet("color: #94a3b8;")
+        roi_layout.addWidget(self.roi_status_lbl)
+
+        btn_recalc_roi = QPushButton("Reset Detection Corridor to Strike Zone")
+        btn_recalc_roi.clicked.connect(self._reset_corridor)
+        roi_layout.addWidget(btn_recalc_roi)
+
+        tracking_layout.addWidget(roi_group)
+        tracking_layout.addStretch()
+
+        right_tabs.addTab(tracking_tab, "Tracking Setup")
+
+        # Tab 3: Lineups & Rosters
         lineup_tab = QWidget()
         lineup_layout = QVBoxLayout(lineup_tab)
         lineup_layout.setSpacing(10)
 
         lineup_splitter = QSplitter(Qt.Horizontal)
-
-        # Away Roster Box
         away_box = QGroupBox("Away Team Lineup (1 per line)")
         away_box_layout = QVBoxLayout(away_box)
         self.away_edit = QTextEdit()
@@ -1073,7 +1118,6 @@ class BlitzballMainWindow(QMainWindow):
         away_box_layout.addWidget(self.away_edit)
         lineup_splitter.addWidget(away_box)
 
-        # Home Roster Box
         home_box = QGroupBox("Home Team Lineup (1 per line)")
         home_box_layout = QVBoxLayout(home_box)
         self.home_edit = QTextEdit()
@@ -1088,9 +1132,9 @@ class BlitzballMainWindow(QMainWindow):
         btn_save_lineups.clicked.connect(self._save_lineups)
         lineup_layout.addWidget(btn_save_lineups)
 
-        right_tabs.addTab(lineup_tab, "👥 Lineups")
+        right_tabs.addTab(lineup_tab, "Lineups")
 
-        # Tab 3: Box Score Summary & Stats
+        # Tab 4: Box Score Summary
         stats_tab = QWidget()
         stats_layout = QVBoxLayout(stats_tab)
         self.stats_text = QTextEdit()
@@ -1098,11 +1142,11 @@ class BlitzballMainWindow(QMainWindow):
         self.stats_text.setFont(QFont("Consolas", 11))
         stats_layout.addWidget(self.stats_text)
 
-        btn_export = QPushButton("💾 Export game_summary.json")
+        btn_export = QPushButton("Export Summary (JSON)")
         btn_export.clicked.connect(self._export_game_summary)
         stats_layout.addWidget(btn_export)
 
-        right_tabs.addTab(stats_tab, "📊 Box Score")
+        right_tabs.addTab(stats_tab, "Box Score")
 
         splitter.addWidget(right_tabs)
         splitter.setSizes([850, 450])
@@ -1137,21 +1181,26 @@ class BlitzballMainWindow(QMainWindow):
         self.video_thread.error_occurred.connect(self._on_video_error)
         self.video_thread.start()
 
-        self.btn_play_pause.setText("⏸ Pause")
+        self.btn_play_pause.setText("Pause")
         self.is_paused = False
 
-        # Default Strike Zone Calibration Polygon if none set
         if self.zone_polygon is None:
-            # Centered default quadrilateral
-            self.zone_polygon = np.array([[220, 120], [420, 120], [420, 360], [220, 360]], dtype=np.int32)
-            self.tracker = PitchTracker(self.zone_polygon)
+            self.zone_polygon = np.array(
+                [[220, 120], [420, 120], [420, 360], [220, 360]], dtype=np.int32
+            )
+            self.tracker = PitchTracker(
+                self.zone_polygon, color_mode=self.ball_color_mode
+            )
 
     @Slot(np.ndarray, float)
     def _on_frame_ready(self, frame: np.ndarray, timestamp: float):
         if self.tracker is None and self.zone_polygon is not None:
-            self.tracker = PitchTracker(self.zone_polygon)
+            self.tracker = PitchTracker(
+                self.zone_polygon, color_mode=self.ball_color_mode
+            )
 
         trajectory = []
+        roi_box = None
         if self.tracker is not None:
             centroid, mask = self.tracker.process_frame(frame, timestamp)
 
@@ -1162,16 +1211,52 @@ class BlitzballMainWindow(QMainWindow):
                 self.tracker.reset()
 
             trajectory = list(self.tracker.trajectory)
+            roi_box = self.tracker.roi_box
 
-        self.canvas.update_frame(frame, trajectory, self.zone_polygon)
+        self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box)
 
     def _on_video_error(self, err_msg: str):
         QMessageBox.critical(self, "Video Error", f"Failed to process video:\n{err_msg}")
 
     def _on_calibration_done(self, points: list):
         self.zone_polygon = np.array(points, dtype=np.int32)
-        self.tracker = PitchTracker(self.zone_polygon)
+        if self.tracker is not None:
+            self.tracker.set_strike_zone(self.zone_polygon)
+        else:
+            self.tracker = PitchTracker(self.zone_polygon, color_mode=self.ball_color_mode)
         self._refresh_display()
+
+    def _on_color_mode_changed(self):
+        mode = self.color_combo.currentData()
+        self.ball_color_mode = mode
+        if self.tracker is not None:
+            self.tracker.set_color_mode(mode)
+
+    def _on_roi_slider_changed(self, value: int):
+        scale = value / 100.0
+        self.roi_status_lbl.setText(f"Width: {value}%")
+        if self.tracker is not None and self.zone_polygon is not None:
+            pts = self.zone_polygon.reshape((-1, 2))
+            min_x, max_x = int(np.min(pts[:, 0])), int(np.max(pts[:, 0]))
+            min_y, max_y = int(np.min(pts[:, 1])), int(np.max(pts[:, 1]))
+            w = max_x - min_x
+            h = max_y - min_y
+
+            margin_x = int(w * 0.75 * scale)
+            margin_top = int(h * 1.5 * scale)
+            margin_bottom = int(h * 0.2)
+
+            rx1 = max(0, min_x - margin_x)
+            ry1 = max(0, min_y - margin_top)
+            rx2 = max_x + margin_x
+            ry2 = max_y + margin_bottom
+
+            self.tracker.roi_box = (rx1, ry1, rx2, ry2)
+
+    def _reset_corridor(self):
+        if self.tracker is not None and self.zone_polygon is not None:
+            self.tracker.set_strike_zone(self.zone_polygon)
+            self.roi_slider.setValue(100)
 
     # -----------------------------------------------------------------------
     # Game Logic & Events
@@ -1183,13 +1268,13 @@ class BlitzballMainWindow(QMainWindow):
 
         if call == "STRIKE":
             event = self.game.record_strike()
-            self.canvas.trigger_alert("⚡ STRIKE!", QColor("#ef4444"), duration_ms=2000)
+            self.canvas.trigger_alert("STRIKE", QColor("#ef4444"), duration_ms=2000)
         else:
             event = self.game.record_ball()
             if event.get("event") == "walk_lobs_triggered":
-                self.canvas.trigger_alert("5 BALLS! 2 LOBS ACTIVE!", QColor("#a855f7"), duration_ms=3000)
+                self.canvas.trigger_alert("5 BALLS - 2 LOBS ACTIVE", QColor("#a855f7"), duration_ms=3000)
             else:
-                self.canvas.trigger_alert("⚾ BALL", QColor("#38bdf8"), duration_ms=2000)
+                self.canvas.trigger_alert("BALL", QColor("#38bdf8"), duration_ms=2000)
 
         self.logger.log_pitch(
             pitcher=pitcher,
@@ -1209,7 +1294,7 @@ class BlitzballMainWindow(QMainWindow):
         event = self.game.record_strike()
         self.logger.log_pitch(pitcher, batter, "STRIKE", [], [-1, -1], True)
         self.logger.log_event(event, pitcher, batter)
-        self.canvas.trigger_alert("⚡ MANUAL STRIKE", QColor("#ef4444"))
+        self.canvas.trigger_alert("MANUAL STRIKE", QColor("#ef4444"))
         self._append_log_row(pitcher, batter, "STRIKE", "MANUAL")
         if self.tracker:
             self.tracker.reset()
@@ -1222,9 +1307,9 @@ class BlitzballMainWindow(QMainWindow):
         self.logger.log_pitch(pitcher, batter, "BALL", [], [-1, -1], False)
         self.logger.log_event(event, pitcher, batter)
         if event.get("event") == "walk_lobs_triggered":
-            self.canvas.trigger_alert("5 BALLS! 2 LOBS ACTIVE!", QColor("#a855f7"), duration_ms=3000)
+            self.canvas.trigger_alert("5 BALLS - 2 LOBS ACTIVE", QColor("#a855f7"), duration_ms=3000)
         else:
-            self.canvas.trigger_alert("⚾ MANUAL BALL", QColor("#38bdf8"))
+            self.canvas.trigger_alert("MANUAL BALL", QColor("#38bdf8"))
         self._append_log_row(pitcher, batter, "BALL", "MANUAL")
         if self.tracker:
             self.tracker.reset()
@@ -1236,7 +1321,7 @@ class BlitzballMainWindow(QMainWindow):
         event = self.game.record_hit()
         self.logger.log_pitch(pitcher, batter, "HIT", [], [-1, -1], False)
         self.logger.log_event(event, pitcher, batter)
-        self.canvas.trigger_alert("💥 BASE HIT!", QColor("#f59e0b"), duration_ms=2500)
+        self.canvas.trigger_alert("BASE HIT", QColor("#f59e0b"), duration_ms=2500)
         self._append_log_row(pitcher, batter, "HIT", "PLAY")
         if self.tracker:
             self.tracker.reset()
@@ -1248,7 +1333,7 @@ class BlitzballMainWindow(QMainWindow):
         event = self.game.record_foul()
         self.logger.log_pitch(pitcher, batter, "FOUL", [], [-1, -1], False)
         self.logger.log_event(event, pitcher, batter)
-        self.canvas.trigger_alert("🛡️ FOUL BALL", QColor("#94a3b8"))
+        self.canvas.trigger_alert("FOUL BALL", QColor("#94a3b8"))
         self._append_log_row(pitcher, batter, "FOUL", "PLAY")
         if self.tracker:
             self.tracker.reset()
@@ -1260,7 +1345,7 @@ class BlitzballMainWindow(QMainWindow):
         event = self.game.record_in_play_out()
         self.logger.log_pitch(pitcher, batter, "IN_PLAY_OUT", [], [-1, -1], False)
         self.logger.log_event(event, pitcher, batter)
-        self.canvas.trigger_alert("🛑 OUT!", QColor("#ef4444"), duration_ms=2000)
+        self.canvas.trigger_alert("OUT", QColor("#ef4444"), duration_ms=2000)
         self._append_log_row(pitcher, batter, "OUT", "PLAY")
         if self.tracker:
             self.tracker.reset()
@@ -1272,7 +1357,7 @@ class BlitzballMainWindow(QMainWindow):
         event = self.game.record_lob_pitch(is_hit=True)
         self.logger.log_pitch(pitcher, batter, "LOB_HIT", [], [-1, -1], False)
         self.logger.log_event(event, pitcher, batter)
-        self.canvas.trigger_alert("🎯 LOB HIT IN PLAY!", QColor("#8b5cf6"), duration_ms=2500)
+        self.canvas.trigger_alert("LOB HIT IN PLAY", QColor("#8b5cf6"), duration_ms=2500)
         self._append_log_row(pitcher, batter, "LOB_HIT", "PLAY")
         if self.tracker:
             self.tracker.reset()
@@ -1303,15 +1388,14 @@ class BlitzballMainWindow(QMainWindow):
         status = self.game.get_status()
         self.scorebug.update_state(status)
 
-        # Update Box Score Text Tab
         summary = self.logger.build_summary()
         text = "=== PITCHER BOX SCORES ===\n"
         for p, stats in summary["pitcher_box_scores"].items():
-            text += f"• {p}: {stats['pitches_thrown']} Pitches | {stats['strikes']} Strikes ({stats['strike_pct']}%) | {stats['K']} K | {stats['BB']} BB | {stats['H']} H\n"
+            text += f"- {p}: {stats['pitches_thrown']} Pitches | {stats['strikes']} Strikes ({stats['strike_pct']}%) | {stats['K']} K | {stats['BB']} BB | {stats['H']} H\n"
 
         text += "\n=== BATTER BOX SCORES ===\n"
         for b, stats in summary["batter_box_scores"].items():
-            text += f"• {b}: {stats['PA']} PA | {stats['H']} H | {stats['BB']} BB | {stats['K']} K | {stats['pitches_seen']} Pitches Seen\n"
+            text += f"- {b}: {stats['PA']} PA | {stats['H']} H | {stats['BB']} BB | {stats['K']} K | {stats['pitches_seen']} Pitches Seen\n"
 
         self.stats_text.setPlainText(text)
 
@@ -1324,7 +1408,7 @@ class BlitzballMainWindow(QMainWindow):
             return
         self.is_paused = not self.is_paused
         self.video_thread.set_paused(self.is_paused)
-        self.btn_play_pause.setText("▶ Resume" if self.is_paused else "⏸ Pause")
+        self.btn_play_pause.setText("Resume" if self.is_paused else "Pause")
 
     def _on_timeline_scrubbed(self, value: int):
         if self.video_thread and self.video_thread.total_frames > 0:
@@ -1339,7 +1423,7 @@ class BlitzballMainWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
-# Application Entry Point
+# Entry Point
 # ---------------------------------------------------------------------------
 def launch_gui(source: Optional[object] = None):
     app = QApplication(sys.argv)

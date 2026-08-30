@@ -1,50 +1,51 @@
-# ⚡ Blitzball Pitch Tracker Pro
+# Blitzball Pitch Tracker Pro
 
-> **Automated AI Umpire & Live Match Bookkeeping Suite for Blitzball**  
-> Real-time Computer Vision ball tracking, automated strike/ball calls, official Blitzball rule enforcement (5 Balls & 2 Lobs), and broadcast-grade GUI.
+> **Automated Computer Vision Umpire & Live Match Bookkeeping Suite for Blitzball**  
+> Real-time Computer Vision ball tracking, automated strike/ball calls, official Blitzball rule enforcement (5 Balls & 2 Lobs), and broadcast-grade desktop interface.
 
 ---
 
-## 🌟 Highlights
+## Key Features
 
-- 🎯 **AI Computer Vision Pitch Tracking**: Detects neon-yellow Blitzballs in HSV color space with morphological filtering, circularity checks, and point-in-polygon strike zone evaluation.
-- 📐 **Interactive 4-Point Strike Zone Calibration**: Click 4 corners directly on the video canvas to define any physical strike zone with a K-Zone 9-box overlay.
-- ⚡ **Official Blitzball Rule Engine**:
+- **Computer Vision Pitch Tracking**: Detects neon-green/yellow and light-blue Blitzballs in HSV color space with morphological filtering, circularity validation, and point-in-polygon strike zone evaluation.
+- **Pitch Corridor Detection (ROI)**: Restricts ball detection to an active corridor around the strike zone and pitching tunnel, rejecting ground clutter, stationary balls on turf, and peripheral movement.
+- **Interactive Strike Zone Calibration**: 4-corner click calibration directly on the video canvas with a 9-box K-Zone grid overlay.
+- **Official Blitzball Rule Engine**:
   - **5 Balls** triggers the **2-Lob Walk Phase**.
-  - **2 Lobs**: Pitcher throws 2 lobs; batter can hit into play or take the base.
+  - **2 Lobs**: Pitcher throws 2 lobs; batter can put the ball in play or complete the walk.
   - **3 Strikes** for a strikeout.
   - **3 Outs** switches half-innings automatically.
-- 📺 **Broadcast-Grade Desktop GUI (PySide6)**: Sleek dark-mode interface with live scorebug, glowing trajectory trails, animated call alerts, LED count matrix, and one-click umpire overrides.
-- 📹 **Multi-Source Video Engine**:
-  - **Live Camera / HDMI Capture Cards**: Low-latency real-time tracking for actual games.
+- **Broadcast-Grade Desktop GUI (PySide6)**: Dark-mode sports analytics interface with live scorebug, pitch trajectory trails, LED count matrix, and one-click umpire overrides.
+- **Multi-Source Video Engine**:
+  - **Live Camera / HDMI Capture Cards**: Real-time tracking for live match play.
   - **Local Video Files**: Test with pre-recorded `.mp4`, `.mov`, `.avi` footage.
   - **YouTube Streaming & Cache**: Seamless YouTube video downloading & caching via `yt-dlp`.
-- 📊 **Automated Box Scores & Data Logging**: Exports detailed game summaries, pitcher/batter stat cards (H, BB, K, Strike %, PA), and pitch-by-pitch trajectory records to `game_summary.json`.
+- **Automated Box Scores & Data Logging**: Exports detailed game summaries, pitcher/batter stat cards (H, BB, K, Strike %, PA), and pitch-by-pitch trajectory records to `game_summary.json`.
 
 ---
 
-## 🏗️ Project Architecture
+## Project Structure
 
 ```
 blitzball/
 ├── gui.py             # Broadcast-grade PySide6 Desktop GUI & Custom Canvas
 ├── main.py            # Master entry point (GUI / CLI launchers)
-├── tracker.py         # OpenCV HSV ball detection, contour filters & trajectory math
+├── tracker.py         # Multi-color HSV detection, corridor ROI & trajectory math
 ├── calibrator.py      # Strike zone 4-point quadrilateral calibration
 ├── state_machine.py   # Blitzball rules engine (5 balls, 2 lobs, 3 strikes, outs, lineups)
 ├── video_source.py    # Multi-source resolver (Webcams, files, yt-dlp caching)
 ├── logger.py          # Box score analytics & JSON export engine
 ├── requirements.txt   # Core dependencies (PySide6, OpenCV, NumPy, yt-dlp)
-├── .gitignore         # Clean repository ignore rules
+├── .gitignore         # Repository ignore rules
 └── README.md          # Documentation & user manual
 ```
 
 ---
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 ### 1. Prerequisites
-Ensure you have **Python 3.10+** installed on your system.
+Ensure you have **Python 3.10+** installed.
 
 ### 2. Clone Repository & Install Dependencies
 ```bash
@@ -55,7 +56,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🎮 How to Run
+## How to Run
 
 ### Launch Desktop GUI (Recommended)
 ```bash
@@ -67,7 +68,7 @@ python main.py
 # Launch directly with a live webcam or USB capture card:
 python main.py --camera 0
 
-# Launch directly with a YouTube game URL:
+# Launch directly with a YouTube video URL:
 python main.py --video "https://www.youtube.com/watch?v=YOUR_VIDEO_ID"
 
 # Launch with a local test video file:
@@ -81,7 +82,7 @@ python main.py --cli --video match.mp4
 
 ---
 
-## ⌨️ Keyboard Shortcuts & Umpire Controls
+## Keyboard Shortcuts & Umpire Controls
 
 | Key | Action |
 | :---: | :--- |
@@ -96,7 +97,7 @@ python main.py --cli --video match.mp4
 
 ---
 
-## 📋 Official Blitzball Game Rules Implemented
+## Official Blitzball Game Rules Implemented
 
 1. **Count System**:
    - **Strikes**: 3 strikes = Strikeout (`outs += 1`, count resets, batter advances).
@@ -113,9 +114,9 @@ python main.py --cli --video match.mp4
 
 ---
 
-## 📊 Exported Box Score Schema (`game_summary.json`)
+## Exported Box Score Schema (`game_summary.json`)
 
-On match conclusion or when clicking **Export game_summary.json**, the session data is saved:
+On match conclusion or when clicking **Export Summary**, the session data is saved:
 
 ```json
 {
@@ -155,5 +156,5 @@ On match conclusion or when clicking **Export game_summary.json**, the session d
 
 ---
 
-## 📜 License
-MIT License. Built for Blitzball communities, leagues, and enthusiasts!
+## License
+MIT License. Built for Blitzball communities and leagues.
