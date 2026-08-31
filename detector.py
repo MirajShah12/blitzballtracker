@@ -6,6 +6,7 @@ Features:
 - Loads custom weights ('models/blitzball_detector.pt') with automatic fallback
   to standard pretrained YOLO ('yolov8n.pt') and classical CV fallback.
 - ROI (Pitch Corridor) high-FPS inference with coordinate re-mapping.
+- Morphological cleaning (cv2.MORPH_OPEN with elliptical 3x3 kernel) to eliminate speckle noise.
 - Target class filtering ('blitzball', 'sports ball', 'target_zone').
 - Configurable confidence thresholding and device selection (CPU/CUDA).
 """
@@ -23,6 +24,8 @@ try:
 except Exception:
     YOLO = None
     ULTRALYTICS_AVAILABLE = False
+
+ELLIPTICAL_KERNEL_3X3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 class BlitzballDetector:
@@ -149,18 +152,21 @@ class BlitzballDetector:
             except Exception:
                 pass
 
-        # 2. Classical CV Fallback (when YOLO has 0 detections or is not loaded)
+        # 2. Classical CV Fallback with Morphological Cleaning
         return self._detect_cv_fallback(crop, ox, oy)
 
     def _detect_cv_fallback(
         self, crop: np.ndarray, ox: int, oy: int
     ) -> List[Tuple[int, int, int, int, float, str]]:
-        """High-speed color blob fallback."""
+        """High-speed color blob fallback with morphological cleaning."""
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         # Neon Green & Light Blue mask
         m1 = cv2.inRange(hsv, np.array([20, 30, 30]), np.array([92, 255, 255]))
         m2 = cv2.inRange(hsv, np.array([80, 30, 30]), np.array([140, 255, 255]))
         mask = cv2.bitwise_or(m1, m2)
+
+        # 1. Morphological OPEN operation with elliptical 3x3 kernel prior to contour extraction
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, ELLIPTICAL_KERNEL_3X3)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         detections = []

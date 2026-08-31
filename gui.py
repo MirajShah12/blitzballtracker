@@ -3,7 +3,8 @@ Blitzball Pitch Tracker Pro - Deep Learning Broadcast Interface (PySide6)
 
 Features:
 - Deep Learning Detector (Ultralytics YOLOv8 / YOLOv11 / custom weights 'models/blitzball_detector.pt').
-- FIFO Trajectory Buffer (smooth glowing pitch trail and strike zone evaluation).
+- Nearest-Neighbor Velocity Gating & Path Plausibility (< 60° vector change).
+- 2nd-Degree Polynomial / Spline Trajectory Smoothing (Broadcast Quality Glowing Trail).
 - Pitch Corridor ROI inference acceleration (high-FPS inference).
 - 100% Thread-safe Video Engine with instant Rewind (-3s), Fast Forward (+3s), Step Back/Forward, and Live Timeline Scrubbing.
 - Slow-Motion & Playback Speed Control (0.25x Super Slow, 0.5x Slow-Mo, 1.0x Normal, 1.5x Fast).
@@ -445,6 +446,7 @@ class VideoCanvas(QWidget):
         self.zone_polygon: Optional[np.ndarray] = None
         self.roi_box: Optional[Tuple[int, int, int, int]] = None
         self.trajectory: List[Tuple[int, int, float]] = []
+        self.smoothed_trajectory: List[Tuple[float, float]] = []
         self.ball_radius: int = 14
 
         # Modes
@@ -470,10 +472,12 @@ class VideoCanvas(QWidget):
         zone_polygon: Optional[np.ndarray],
         roi_box: Optional[Tuple[int, int, int, int]] = None,
         diagnostic_mask: Optional[np.ndarray] = None,
+        smoothed_trajectory: Optional[List[Tuple[float, float]]] = None,
     ):
         self.current_frame = frame
         self.diagnostic_mask = diagnostic_mask
         self.trajectory = trajectory
+        self.smoothed_trajectory = smoothed_trajectory or []
         self.zone_polygon = zone_polygon
         self.roi_box = roi_box
         self.update()
@@ -640,20 +644,24 @@ class VideoCanvas(QWidget):
                         prev = to_widget(poly_to_draw[i - 1][0], poly_to_draw[i - 1][1])
                         painter.drawLine(prev, pt)
 
-        # 3. FIFO Trajectory Flight Trail (Glowing gradient)
-        if len(self.trajectory) >= 2:
+        # 3. 2nd-Degree Polynomial Smoothed Glowing Trajectory Flight Trail
+        points_for_trail = self.smoothed_trajectory if len(self.smoothed_trajectory) >= 2 else self.trajectory
+
+        if len(points_for_trail) >= 2:
             path = QPainterPath()
-            start = to_widget(self.trajectory[0][0], self.trajectory[0][1])
+            start = to_widget(points_for_trail[0][0], points_for_trail[0][1])
             path.moveTo(start)
 
-            for i in range(1, len(self.trajectory)):
-                pt = to_widget(self.trajectory[i][0], self.trajectory[i][1])
+            for i in range(1, len(points_for_trail)):
+                pt = to_widget(points_for_trail[i][0], points_for_trail[i][1])
                 path.lineTo(pt)
 
+            # Outer glow
             painter.setBrush(Qt.NoBrush)
             painter.setPen(QPen(QColor(234, 179, 8, 90), 8, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
+            # Core bright laser line
             painter.setPen(QPen(QColor(250, 204, 21, 230), 2.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
             painter.drawPath(path)
 
@@ -1350,6 +1358,7 @@ class BlitzballMainWindow(QMainWindow):
             )
 
         trajectory = []
+        smoothed_trajectory = []
         roi_box = None
         diag_mask = None
 
@@ -1363,10 +1372,18 @@ class BlitzballMainWindow(QMainWindow):
                 self.tracker.reset()
 
             trajectory = list(self.tracker.trajectory)
+            smoothed_trajectory = self.tracker.get_smoothed_trajectory(num_samples=35)
             roi_box = self.tracker.roi_box
             self.canvas.ball_radius = getattr(self.tracker, "current_ball_radius", 14)
 
-        self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box, diag_mask)
+        self.canvas.update_frame(
+            frame,
+            trajectory,
+            self.zone_polygon,
+            roi_box,
+            diag_mask,
+            smoothed_trajectory=smoothed_trajectory,
+        )
 
         # Update Timeline Slider & Timecode (only if not dragging)
         if total_frames > 0 and not self.is_user_scrubbing:
