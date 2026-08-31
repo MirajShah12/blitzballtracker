@@ -1,15 +1,16 @@
 """
 Blitzball Pitch Tracker & Game Engine — Master Entry Point
 
-Launches the broadcast-grade AI Computer Vision Desktop GUI by default,
+Launches the broadcast-grade Deep Learning AI Computer Vision Desktop GUI by default,
 or runs in CLI/Headless mode with `--cli`.
 
 Usage::
 
-    python main.py                              # Launches the Modern GUI
-    python main.py --video "https://youtu.be/x" # Launches GUI with YouTube link
-    python main.py --camera 0                   # Launches GUI with Webcam 0
-    python main.py --cli --video game.mp4       # Headless CLI mode
+    python main.py                                      # Launches Deep Learning GUI
+    python main.py --video "https://youtu.be/x"         # Launches GUI with YouTube link
+    python main.py --weights models/blitzball.pt        # Load custom YOLO weights
+    python main.py --camera 0                           # Launches GUI with Webcam 0
+    python main.py --cli --video game.mp4               # Headless CLI mode
 """
 
 import argparse
@@ -20,7 +21,7 @@ from gui import launch_gui
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Blitzball Pitch Tracker Pro — AI Automated Umpire & Live Bookkeeping System",
+        description="Blitzball Pitch Tracker Pro — Deep Learning Automated Umpire & Tracking System",
     )
     parser.add_argument(
         "--video",
@@ -34,34 +35,16 @@ def main() -> None:
         help="Camera device index for real-time match tracking (e.g. 0).",
     )
     parser.add_argument(
-        "--motion-thresh",
-        type=int,
-        default=18,
-        help="Motion sensitivity threshold for frame differencing (5-60, default 18).",
+        "--weights",
+        type=str,
+        default="models/blitzball_detector.pt",
+        help="Path to custom YOLO model weights (.pt).",
     )
     parser.add_argument(
-        "--min-area",
-        type=int,
-        default=25,
-        help="Minimum ball contour area in pixels (default 25).",
-    )
-    parser.add_argument(
-        "--max-area",
-        type=int,
-        default=1800,
-        help="Maximum ball contour area in pixels (default 1800).",
-    )
-    parser.add_argument(
-        "--min-circ",
+        "--conf",
         type=float,
-        default=0.35,
-        help="Minimum circularity threshold to reject flat plates (default 0.35).",
-    )
-    parser.add_argument(
-        "--sensitivity",
-        type=int,
-        default=75,
-        help="Overall pitch detection sensitivity (1-100, default 75).",
+        default=0.25,
+        help="YOLO detection confidence threshold (default 0.25).",
     )
     parser.add_argument(
         "--cli",
@@ -93,10 +76,10 @@ def main() -> None:
         cap, is_live = open_source(source)
         zone_polygon = calibrate_strike_zone(cap)
         game = GameState()
-        tracker = PitchTracker(zone_polygon)
+        tracker = PitchTracker(zone_polygon, weights_path=args.weights, conf_thresh=args.conf)
         logger = GameLogger()
 
-        window_name = "Blitzball Pitch Tracker CLI"
+        window_name = "Blitzball Pitch Tracker CLI (YOLO)"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
         while True:
@@ -127,7 +110,7 @@ def main() -> None:
         return
 
     # Default: Modern Broadcast Desktop GUI
-    launch_gui(source=source)
+    launch_gui(source=source, weights_path=args.weights, conf_thresh=args.conf)
 
 
 if __name__ == "__main__":

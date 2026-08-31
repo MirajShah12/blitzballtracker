@@ -1,67 +1,61 @@
 """
-Simplified, Ultra-Robust Blitzball Pitch Tracker
+Deep Learning Pitch Tracker with YOLO Inference & FIFO Trajectory Buffer (Inspired by BaseballCV)
 
-Designed for maximum reliability and simplicity:
-1. Corridor ROI: Focuses strictly between the pitcher's release and home plate.
-2. Direct Color Extraction: Finds Neon Green/Yellow, Light Blue, or Calibrated Ball color.
-3. Forward Motion Vectoring: Tracks moving ball centroids traveling toward the strike zone.
-4. Point-in-Polygon Evaluation: Direct strike vs ball call on the calibrated strike zone.
+Features:
+1. Deep Learning Object Detection:
+   - Powered by BlitzballDetector (Ultralytics YOLOv8 / YOLOv11 / custom weights).
+   - High-FPS inference accelerated on Pitch Corridor ROI.
+2. FIFO Trajectory Buffer:
+   - Fixed-size deque maintaining smooth historical ball flight coordinates.
+3. Strike Zone Point-in-Polygon Evaluation:
+   - Evaluates pitches that cross or land inside the calibrated physical strike zone polygon.
+4. Trajectory Rendering:
+   - Smooth glowing flight trail and target reticle overlay.
 """
 
+from collections import deque
 import math
-from typing import Dict, List, Optional, Tuple
+import os
+import time
+from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Default HSV Bounds (Broad & forgiving to capture motion-blurred ball)
-# ---------------------------------------------------------------------------
-DEFAULT_NEON_H_MIN = 20
-DEFAULT_NEON_H_MAX = 92
-DEFAULT_NEON_S_MIN = 25
-DEFAULT_NEON_V_MIN = 25
-
-DEFAULT_BLUE_H_MIN = 80
-DEFAULT_BLUE_H_MAX = 140
-DEFAULT_BLUE_S_MIN = 25
-DEFAULT_BLUE_V_MIN = 25
-
-MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+from detector import BlitzballDetector
 
 
 class PitchTracker:
-    """Streamlined pitch tracker focused on robust color centroid flight paths."""
+    """Deep learning pitch tracker with YOLO detection and FIFO trajectory state."""
 
     def __init__(
         self,
         zone_polygon: np.ndarray,
-        color_mode: str = "auto",
+        weights_path: str = "models/blitzball_detector.pt",
+        conf_thresh: float = 0.25,
         roi_box: Optional[Tuple[int, int, int, int]] = None,
-        sensitivity: int = 75,
+        max_trajectory_len: int = 60,
     ):
-        self.color_mode = color_mode
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         self.roi_box: Optional[Tuple[int, int, int, int]] = roi_box
 
-        # Dynamic HSV Bounds
-        self.h_min: int = DEFAULT_NEON_H_MIN
-        self.h_max: int = DEFAULT_NEON_H_MAX
-        self.s_min: int = DEFAULT_NEON_S_MIN
-        self.v_min: int = DEFAULT_NEON_V_MIN
-        self.use_custom_bounds: bool = False
+        # Deep Learning Detector
+        self.detector = BlitzballDetector(
+            weights_path=weights_path,
+            conf_thresh=conf_thresh,
+        )
 
-        # Flight thresholds
-        self.sensitivity = sensitivity
+        # FIFO Trajectory Buffer [(x, y, timestamp)]
+        self.trajectory: Deque[Tuple[int, int, float]] = deque(maxlen=max_trajectory_len)
+        self.current_ball_radius: int = 14
+        self.current_confidence: float = 0.0
+
+        # Physical trajectory thresholds
         self.min_pitch_frames = 2
         self.min_travel_px = 8.0
         self.max_jump_px = 250.0
 
-        # Trajectory points: [(x, y, timestamp)]
-        self.trajectory: List[Tuple[int, int, float]] = []
-        self.current_ball_radius: int = 14
-
-        # State tracking
+        # Pitch lifecycle state
         self.last_pitch_timestamp: float = -999.0
         self._frames_without_detection: int = 0
         self._pitch_active: bool = False
@@ -72,50 +66,15 @@ class PitchTracker:
         else:
             self.set_strike_zone(zone_polygon)
 
-    def set_hsv_bounds(self, h_min: int, h_max: int, s_min: int, v_min: int) -> None:
-        """Set custom HSV bounds dynamically from UI sliders."""
-        self.h_min = max(0, min(179, h_min))
-        self.h_max = max(0, min(179, h_max))
-        self.s_min = max(0, min(255, s_min))
-        self.v_min = max(0, min(255, v_min))
-        self.use_custom_bounds = True
+    @property
+    def model_type(self) -> str:
+        return self.detector.model_type
 
-    def reset_custom_color(self) -> None:
-        """Reset HSV to preset defaults."""
-        self.use_custom_bounds = False
-        if self.color_mode == "light_blue":
-            self.h_min, self.h_max = DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_H_MAX
-            self.s_min, self.v_min = DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN
-        else:
-            self.h_min, self.h_max = DEFAULT_NEON_H_MIN, DEFAULT_NEON_H_MAX
-            self.s_min, self.v_min = DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN
-
-    def sample_color_at_pixel(self, frame: np.ndarray, x: int, y: int) -> Tuple[int, int, int, int]:
-        """Calibrate color bounds from a clicked pixel on the ball."""
-        fh, fw = frame.shape[:2]
-        x = max(0, min(fw - 1, x))
-        y = max(0, min(fh - 1, y))
-
-        x1, y1 = max(0, x - 5), max(0, y - 5)
-        x2, y2 = min(fw, x + 6), min(fh, y + 6)
-        patch = frame[y1:y2, x1:x2]
-
-        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        h_med = int(np.median(hsv_patch[:, :, 0]))
-        s_med = int(np.median(hsv_patch[:, :, 1]))
-        v_med = int(np.median(hsv_patch[:, :, 2]))
-
-        # Broad tolerance for moving ball under changing lighting
-        self.h_min = max(0, h_med - 25)
-        self.h_max = min(179, h_med + 25)
-        self.s_min = max(15, s_med - 85)
-        self.v_min = max(15, v_med - 85)
-        self.use_custom_bounds = True
-
-        return self.h_min, self.h_max, self.s_min, self.v_min
+    def set_confidence(self, conf: float) -> None:
+        self.detector.set_confidence(conf)
 
     def set_corridor_box(self, x1: int, y1: int, x2: int, y2: int) -> None:
-        """Manually calibrate the exact pitch corridor rectangle."""
+        """Manually calibrate pitch corridor rectangle."""
         rx1, rx2 = min(x1, x2), max(x1, x2)
         ry1, ry2 = min(y1, y2), max(y1, y2)
         self.roi_box = (rx1, ry1, rx2, ry2)
@@ -137,7 +96,7 @@ class PitchTracker:
             w = max_x - min_x
             h = max_y - min_y
 
-            # Corridor around strike zone + pitcher path
+            # Corridor from pitcher release to plate
             margin_x = int(w * 0.9)
             margin_top = int(h * 3.0)
             margin_bottom = int(h * 0.3)
@@ -153,117 +112,75 @@ class PitchTracker:
 
             self.roi_box = (rx1, ry1, rx2, ry2)
 
-    def set_color_mode(self, mode: str) -> None:
-        self.color_mode = mode
-        self.reset_custom_color()
-
     def reset(self) -> None:
         self.trajectory.clear()
         self._frames_without_detection = 0
         self._pitch_active = False
 
-    def _get_color_mask(self, hsv_roi: np.ndarray) -> np.ndarray:
-        """Create clean HSV color mask for Blitzball."""
-        if self.use_custom_bounds:
-            lower = np.array([self.h_min, self.s_min, self.v_min], dtype=np.uint8)
-            upper = np.array([self.h_max, 255, 255], dtype=np.uint8)
-            mask = cv2.inRange(hsv_roi, lower, upper)
-        elif self.color_mode == "neon_green":
-            lower = np.array([DEFAULT_NEON_H_MIN, DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN], dtype=np.uint8)
-            upper = np.array([DEFAULT_NEON_H_MAX, 255, 255], dtype=np.uint8)
-            mask = cv2.inRange(hsv_roi, lower, upper)
-        elif self.color_mode == "light_blue":
-            lower = np.array([DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN], dtype=np.uint8)
-            upper = np.array([DEFAULT_BLUE_H_MAX, 255, 255], dtype=np.uint8)
-            mask = cv2.inRange(hsv_roi, lower, upper)
-        else:
-            # Auto: detect both Neon Green/Yellow and Light Blue
-            m1 = cv2.inRange(
-                hsv_roi,
-                np.array([DEFAULT_NEON_H_MIN, DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN], dtype=np.uint8),
-                np.array([DEFAULT_NEON_H_MAX, 255, 255], dtype=np.uint8),
-            )
-            m2 = cv2.inRange(
-                hsv_roi,
-                np.array([DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN], dtype=np.uint8),
-                np.array([DEFAULT_BLUE_H_MAX, 255, 255], dtype=np.uint8),
-            )
-            mask = cv2.bitwise_or(m1, m2)
-
-        # Light opening to remove single-pixel noise without degrading moving ball
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
-        return mask
-
     def process_frame(
         self, frame: np.ndarray, timestamp: float
     ) -> Tuple[Optional[Tuple[int, int]], np.ndarray]:
-        """Extract Blitzball position and maintain flight trajectory."""
+        """
+        Run deep learning YOLO inference on Pitch Corridor ROI and track ball centroid.
+        Returns: (best_centroid, debug_mask_or_annotated_frame)
+        """
         fh, fw = frame.shape[:2]
 
-        if self.roi_box is not None:
-            rx1, ry1, rx2, ry2 = self.roi_box
-            rx1, ry1 = max(0, rx1), max(0, ry1)
-            rx2, ry2 = min(fw, rx2), min(fh, ry2)
-        else:
-            rx1, ry1, rx2, ry2 = 0, 0, fw, fh
-
-        roi_img = frame[ry1:ry2, rx1:rx2]
-        if roi_img.size == 0:
-            return None, np.zeros((fh, fw), dtype=np.uint8)
-
-        hsv_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-        mask_roi = self._get_color_mask(hsv_roi)
-
-        contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        candidates = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            # Accept reasonable ball size in flight
-            if area < 8 or area > 7000:
-                continue
-
-            (x, y), radius = cv2.minEnclosingCircle(c)
-            cx = int(x) + rx1
-            cy = int(y) + ry1
-            candidates.append((cx, cy, area, max(8, int(radius))))
+        # 1. Run YOLO inference on Corridor ROI
+        detections = self.detector.detect(frame, roi_box=self.roi_box)
 
         best_point: Optional[Tuple[int, int]] = None
         best_rad: int = 14
+        best_conf: float = 0.0
 
-        if candidates:
+        if detections:
+            # Filter for ball class detections
+            ball_dets = [d for d in detections if "zone" not in d[5].lower()]
+            if not ball_dets:
+                ball_dets = detections
+
             if self._pitch_active and self.trajectory:
                 last_x, last_y = self.trajectory[-1][0], self.trajectory[-1][1]
                 min_dist = float("inf")
-                for cx, cy, area, rad in candidates:
+
+                for cx, cy, bw, bh, conf, cls_name in ball_dets:
                     dist = math.hypot(cx - last_x, cy - last_y)
-                    # Must be within max jump, and not jump backwards/upwards
+                    # Must be within max jump, moving generally toward plate
                     if dist < self.max_jump_px and cy >= last_y - 15:
                         if dist < min_dist:
                             min_dist = dist
                             best_point = (cx, cy)
-                            best_rad = rad
+                            best_rad = max(8, int((bw + bh) / 4))
+                            best_conf = conf
             else:
-                # Start new pitch: pick largest colored blob in corridor
-                candidates.sort(key=lambda c: c[2], reverse=True)
-                best_point = (candidates[0][0], candidates[0][1])
-                best_rad = candidates[0][3]
+                # Start new pitch: pick highest confidence detection in corridor
+                ball_dets.sort(key=lambda d: d[4], reverse=True)
+                best_point = (ball_dets[0][0], ball_dets[0][1])
+                best_rad = max(8, int((ball_dets[0][2] + ball_dets[0][3]) / 4))
+                best_conf = ball_dets[0][4]
 
+        # 2. Update FIFO Trajectory
         if best_point is not None:
             self.current_ball_radius = best_rad
+            self.current_confidence = best_conf
             self.trajectory.append((best_point[0], best_point[1], timestamp))
             self._frames_without_detection = 0
             self._pitch_active = True
         elif self._pitch_active:
             self._frames_without_detection += 1
 
-        full_mask = np.zeros((fh, fw), dtype=np.uint8)
-        full_mask[ry1:ry2, rx1:rx2] = mask_roi
+        # 3. Generate Diagnostic Visual Mask
+        diag_mask = np.zeros((fh, fw), dtype=np.uint8)
+        if self.roi_box is not None:
+            rx1, ry1, rx2, ry2 = self.roi_box
+            cv2.rectangle(diag_mask, (rx1, ry1), (rx2, ry2), 40, -1)
+        for cx, cy, bw, bh, conf, _ in detections:
+            cv2.circle(diag_mask, (cx, cy), max(8, int((bw + bh) / 4)), 255, -1)
 
-        return best_point, full_mask
+        return best_point, diag_mask
 
     def is_pitch_complete(self) -> bool:
-        """Evaluate pitch conclusion based on gap threshold and minimum forward flight."""
+        """Evaluate pitch conclusion based on gap threshold and minimum vertical flight."""
         if not (self._pitch_active and self._frames_without_detection >= self._gap_threshold):
             return False
 
@@ -275,7 +192,6 @@ class PitchTracker:
         final_pt = self.trajectory[-1]
         y_travel = final_pt[1] - start_pt[1]
 
-        # Valid pitch moves forward/downward toward the plate
         if y_travel < self.min_travel_px:
             self.reset()
             return False
@@ -299,19 +215,27 @@ class PitchTracker:
             "final_coord": [x_final, y_final],
             "trajectory_points": [[x, y, t] for x, y, t in self.trajectory],
             "in_zone": in_zone,
+            "confidence": self.current_confidence,
         }
 
     def draw_overlay(self, frame: np.ndarray, zone_polygon: np.ndarray) -> np.ndarray:
+        """Draw strike zone and smooth glowing trajectory trail on frame."""
         pts = zone_polygon.reshape((-1, 1, 2))
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
-        for i in range(1, len(self.trajectory)):
-            pt1 = (self.trajectory[i - 1][0], self.trajectory[i - 1][1])
-            pt2 = (self.trajectory[i][0], self.trajectory[i][1])
-            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
+        # Draw Trajectory Trail
+        traj_list = list(self.trajectory)
+        for i in range(1, len(traj_list)):
+            pt1 = (traj_list[i - 1][0], traj_list[i - 1][1])
+            pt2 = (traj_list[i][0], traj_list[i][1])
+            alpha = i / len(traj_list)
+            thickness = max(2, int(4 * alpha))
+            cv2.line(frame, pt1, pt2, (0, int(220 * alpha) + 35, 255), thickness)
 
-        if self.trajectory:
-            last = self.trajectory[-1]
-            cv2.circle(frame, (last[0], last[1]), self.current_ball_radius, (0, 255, 255), 2)
+        # Draw Target Reticle on latest point
+        if traj_list:
+            last = traj_list[-1]
+            rad = self.current_ball_radius
+            cv2.circle(frame, (last[0], last[1]), rad, (0, 255, 255), 2)
 
         return frame
