@@ -104,16 +104,24 @@ def download_youtube_video(
     return target_path
 
 
-def scan_available_cameras(max_tested: int = 4) -> List[int]:
-    """Scan and return indices of active camera devices."""
+def scan_available_cameras(max_tested: int = 2) -> List[int]:
+    """Scan and return indices of active camera devices without console spam."""
+    try:
+        cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
+    except Exception:
+        pass
+
     available = []
     for idx in range(max_tested):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) if os.name == "nt" else cv2.VideoCapture(idx)
-        if cap.isOpened():
-            ret, _ = cap.read()
-            if ret:
-                available.append(idx)
-            cap.release()
+        try:
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                ret, _ = cap.read()
+                if ret:
+                    available.append(idx)
+                cap.release()
+        except Exception:
+            pass
     return available if available else [0]
 
 

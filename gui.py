@@ -1,11 +1,12 @@
 """
-Blitzball Pitch Tracker Pro - Simplified Broadcast Interface (PySide6)
+Blitzball Pitch Tracker Pro - Professional Broadcast Interface (PySide6)
 
 Features:
-- Full media playback controls: Play/Pause, Rewind (-3s), Fast Forward (+3s), Step Back/Forward, and Timeline Scrubbing.
-- Pure high-speed OpenCV color tracking (Neon Green/Yellow, Light Blue, and 1-Click Pixel Sampler).
-- Non-obstructive hollow target reticle (never obscures the ball).
-- Pitch Corridor ROI with adjustable width.
+- 100% Thread-safe Video Engine with instant Rewind (-3s), Fast Forward (+3s), Step Back/Forward, and Live Timeline Scrubbing.
+- Slow-Motion & Playback Speed Control (0.25x Slow-Mo, 0.5x, 1.0x Normal, 1.5x Fast).
+- Zone-First Plate Crossing Ball Tracker (tracks high-velocity pitches near the zone).
+- 1-Click Interactive Ball Color Sampler (click the ball in video to calibrate).
+- Live Diagnostic Vision Mask toggle.
 - Official Blitzball 5-ball walk & 2-lob rules.
 - Live box scores and pitch logs.
 """
@@ -19,6 +20,8 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 from PySide6.QtCore import (
+    QMutex,
+    QMutexLocker,
     QPoint,
     QPointF,
     QRect,
@@ -296,10 +299,10 @@ QCheckBox::indicator:checked {
 
 
 # ---------------------------------------------------------------------------
-# Video Worker Thread with Real-Time Seeking & Rewinding
+# Thread-Safe Video Worker
 # ---------------------------------------------------------------------------
 class VideoThread(QThread):
-    """Thread for steady video capture with instant seeking and rewinding."""
+    """Thread-safe OpenCV video playback and frame decoder."""
 
     frame_ready = Signal(np.ndarray, float, int, int)  # frame, timestamp_sec, curr_frame, total_frames
     stream_finished = Signal()
@@ -312,19 +315,35 @@ class VideoThread(QThread):
         self.paused = False
         self.cap: Optional[cv2.VideoCapture] = None
         self.fps = 30.0
+        self.playback_speed = 1.0
         self.is_live = False
         self.total_frames = 0
         self.current_frame_idx = 0
+        self._requested_seek_frame: Optional[int] = None
+        self.mutex = QMutex()
+
+    def set_playback_speed(self, speed: float):
+        """Set slow-motion or fast playback multiplier (e.g. 0.25, 0.5, 1.0)."""
+        self.playback_speed = max(0.1, speed)
+
+    def seek_frame(self, frame_idx: int):
+        """Thread-safe seek request queued for worker thread."""
+        if not self.is_live and self.total_frames > 0:
+            with QMutexLocker(self.mutex):
+                self._requested_seek_frame = max(0, min(self.total_frames - 1, frame_idx))
+
+    def seek_relative_seconds(self, delta_sec: float):
+        """Rewind or fast forward relative to current position."""
+        if not self.is_live and self.total_frames > 0:
+            delta_frames = int(delta_sec * self.fps)
+            target = self.current_frame_idx + delta_frames
+            self.seek_frame(target)
 
     def run(self):
         self.running = True
         try:
             if isinstance(self.source, int):
-                self.cap = (
-                    cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
-                    if os.name == "nt"
-                    else cv2.VideoCapture(self.source)
-                )
+                self.cap = cv2.VideoCapture(self.source)
                 self.is_live = True
             else:
                 self.cap = cv2.VideoCapture(self.source)
@@ -338,13 +357,33 @@ class VideoThread(QThread):
             if not self.is_live:
                 self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-            frame_delay = (1.0 / self.fps) if not self.is_live else 0.001
-
             while self.running:
+                # 1. Process thread-safe seek requests immediately
+                seek_target = None
+                with QMutexLocker(self.mutex):
+                    if self._requested_seek_frame is not None:
+                        seek_target = self._requested_seek_frame
+                        self._requested_seek_frame = None
+
+                if seek_target is not None and not self.is_live:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, seek_target)
+                    ret, frame = self.cap.read()
+                    if ret:
+                        self.current_frame_idx = seek_target
+                        ts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                        self.frame_ready.emit(frame, ts, self.current_frame_idx, self.total_frames)
+                        # Keep video pointer positioned at sought frame
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, seek_target)
+                    if self.paused:
+                        time.sleep(0.02)
+                        continue
+
+                # 2. Check paused state
                 if self.paused and not self.is_live:
                     time.sleep(0.02)
                     continue
 
+                # 3. Read next frame
                 start_time = time.time()
                 ret, frame = self.cap.read()
 
@@ -363,6 +402,7 @@ class VideoThread(QThread):
                 self.frame_ready.emit(frame, ts, self.current_frame_idx, self.total_frames)
 
                 if not self.is_live:
+                    frame_delay = 1.0 / (self.fps * self.playback_speed)
                     elapsed = time.time() - start_time
                     sleep_time = max(0.001, frame_delay - elapsed)
                     time.sleep(sleep_time)
@@ -377,26 +417,6 @@ class VideoThread(QThread):
 
     def set_paused(self, paused: bool):
         self.paused = paused
-
-    def seek_frame(self, frame_idx: int):
-        """Seek to specific frame and emit immediate preview even while paused."""
-        if self.cap and not self.is_live:
-            target = max(0, min(self.total_frames - 1, frame_idx))
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-            self.current_frame_idx = target
-            ret, frame = self.cap.read()
-            if ret:
-                ts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                self.frame_ready.emit(frame, ts, self.current_frame_idx, self.total_frames)
-                # Keep position at target
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, target)
-
-    def seek_relative_seconds(self, delta_sec: float):
-        """Rewind or fast-forward relative to current position."""
-        if self.cap and not self.is_live:
-            delta_frames = int(delta_sec * self.fps)
-            target = self.current_frame_idx + delta_frames
-            self.seek_frame(target)
 
     def stop(self):
         self.running = False
@@ -464,7 +484,7 @@ class VideoCanvas(QWidget):
     def start_color_sampling(self):
         self.is_sampling_color = True
         self.is_calibrating = False
-        self.trigger_alert("COLOR SAMPLER: Click directly on the ball in video", QColor("#f59e0b"), duration_ms=3000)
+        self.trigger_alert("COLOR SAMPLER: Click directly on the ball", QColor("#f59e0b"), duration_ms=3000)
         self.update()
 
     def mousePressEvent(self, event):
@@ -1054,8 +1074,16 @@ class BlitzballMainWindow(QMainWindow):
         self.btn_forward = QPushButton("+3s >>")
         self.btn_forward.clicked.connect(lambda: self.seek_relative(3.0))
 
+        # Slow-Motion Playback Speed Selector
+        self.speed_combo = QComboBox()
+        self.speed_combo.addItem("1.0x (Normal)", 1.0)
+        self.speed_combo.addItem("0.5x (Slow-Mo)", 0.5)
+        self.speed_combo.addItem("0.25x (Super Slow)", 0.25)
+        self.speed_combo.addItem("1.5x (Fast)", 1.5)
+        self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
+
         # Strike Zone & Color Actions
-        self.btn_calibrate = QPushButton("Calibrate Strike Zone")
+        self.btn_calibrate = QPushButton("Calibrate Zone")
         self.btn_calibrate.clicked.connect(self.canvas.start_calibration)
 
         self.btn_sample_color = QPushButton("Sample Ball Color")
@@ -1072,7 +1100,10 @@ class BlitzballMainWindow(QMainWindow):
         playback_bar.addWidget(self.btn_play_pause)
         playback_bar.addWidget(self.btn_step_fwd)
         playback_bar.addWidget(self.btn_forward)
-        playback_bar.addSpacing(10)
+        playback_bar.addSpacing(6)
+        playback_bar.addWidget(QLabel("Speed:"))
+        playback_bar.addWidget(self.speed_combo)
+        playback_bar.addSpacing(6)
         playback_bar.addWidget(self.btn_calibrate)
         playback_bar.addWidget(self.btn_sample_color)
         playback_bar.addWidget(self.chk_show_mask)
@@ -1177,14 +1208,14 @@ class BlitzballMainWindow(QMainWindow):
         # Sensitivity / Strictness Slider
         sens_group = QGroupBox("Detection Sensitivity")
         sens_layout = QVBoxLayout(sens_group)
-        sens_layout.addWidget(QLabel("Sensitivity Slider (Catch Rate vs Strictness):"))
+        sens_layout.addWidget(QLabel("Sensitivity Slider (Zone Crossing Catch Rate):"))
         self.sens_slider = QSlider(Qt.Horizontal)
         self.sens_slider.setRange(1, 100)
         self.sens_slider.setValue(75)
         self.sens_slider.valueChanged.connect(self._on_sensitivity_changed)
         sens_layout.addWidget(self.sens_slider)
 
-        self.sens_status_lbl = QLabel("Sensitivity: 75% (High Catch Rate - Captures fast pitches)")
+        self.sens_status_lbl = QLabel("Sensitivity: 75% (High Catch Rate - Detects fast pitches crossing plate)")
         self.sens_status_lbl.setStyleSheet("color: #38bdf8;")
         sens_layout.addWidget(self.sens_status_lbl)
         tracking_layout.addWidget(sens_group)
@@ -1357,25 +1388,30 @@ class BlitzballMainWindow(QMainWindow):
         self.btn_play_pause.setText("Resume" if self.is_paused else "Pause")
 
     def seek_relative(self, seconds: float):
-        """Rewind or fast-forward by N seconds."""
+        """Thread-safe rewind or fast forward."""
         if self.video_thread and not self.video_thread.is_live:
             if self.tracker:
                 self.tracker.reset()
             self.video_thread.seek_relative_seconds(seconds)
 
     def step_forward(self):
-        """Step forward exactly 1 frame."""
+        """Step forward 1 frame."""
         if self.video_thread and not self.video_thread.is_live:
             if not self.is_paused:
                 self.toggle_playback()
             self.video_thread.seek_frame(self.video_thread.current_frame_idx + 1)
 
     def step_backward(self):
-        """Step backward exactly 1 frame."""
+        """Step backward 1 frame."""
         if self.video_thread and not self.video_thread.is_live:
             if not self.is_paused:
                 self.toggle_playback()
             self.video_thread.seek_frame(max(0, self.video_thread.current_frame_idx - 1))
+
+    def _on_speed_changed(self):
+        speed = float(self.speed_combo.currentData())
+        if self.video_thread:
+            self.video_thread.set_playback_speed(speed)
 
     def _on_slider_pressed(self):
         self.is_user_scrubbing = True
@@ -1416,7 +1452,7 @@ class BlitzballMainWindow(QMainWindow):
 
     def _on_sensitivity_changed(self, value: int):
         if value >= 75:
-            lbl = f"Sensitivity: {value}% (High Catch Rate - Captures fast pitches)"
+            lbl = f"Sensitivity: {value}% (High Catch Rate - Detects fast pitches crossing plate)"
             color = "#38bdf8"
         elif value >= 45:
             lbl = f"Sensitivity: {value}% (Balanced Detection)"
@@ -1462,9 +1498,9 @@ class BlitzballMainWindow(QMainWindow):
             w = max_x - min_x
             h = max_y - min_y
 
-            margin_x = int(w * 1.1 * scale)
-            margin_top = int(h * 3.2 * scale)
-            margin_bottom = int(h * 0.3)
+            margin_x = int(w * 1.2 * scale)
+            margin_top = int(h * 3.5 * scale)
+            margin_bottom = int(h * 0.4)
 
             rx1 = max(0, min_x - margin_x)
             ry1 = max(0, min_y - margin_top)
