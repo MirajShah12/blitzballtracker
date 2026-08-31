@@ -2,11 +2,12 @@
 Blitzball Pitch Tracker Pro - Professional Broadcast Interface (PySide6)
 
 Features:
+- High-Definition Video Feed (1080p60/720p60 stream support).
 - 100% Thread-safe Video Engine with instant Rewind (-3s), Fast Forward (+3s), Step Back/Forward, and Live Timeline Scrubbing.
-- Slow-Motion & Playback Speed Control (0.25x Slow-Mo, 0.5x, 1.0x Normal, 1.5x Fast).
-- Zone-First Plate Crossing Ball Tracker (tracks high-velocity pitches near the zone).
-- 1-Click Interactive Ball Color Sampler (click the ball in video to calibrate).
-- Live Diagnostic Vision Mask toggle.
+- Slow-Motion & Playback Speed Control (0.25x Super Slow, 0.5x Slow-Mo, 1.0x Normal, 1.5x Fast).
+- Interactive 2-Click Pitch Corridor Calibration (Release Window -> Plate).
+- Interactive Live HSV Sliders & 1-Click Color Eyedropper with Live Vision Mask.
+- Zone-First Plate Crossing Ball Tracker.
 - Official Blitzball 5-ball walk & 2-lob rules.
 - Live box scores and pitch logs.
 """
@@ -76,7 +77,17 @@ from PySide6.QtWidgets import (
 
 from logger import GameLogger
 from state_machine import BALLS_FOR_WALK, MAX_LOBS, STRIKES_FOR_OUT, GameState
-from tracker import PitchTracker
+from tracker import (
+    DEFAULT_BLUE_H_MAX,
+    DEFAULT_BLUE_H_MIN,
+    DEFAULT_BLUE_S_MIN,
+    DEFAULT_BLUE_V_MIN,
+    DEFAULT_NEON_H_MAX,
+    DEFAULT_NEON_H_MIN,
+    DEFAULT_NEON_S_MIN,
+    DEFAULT_NEON_V_MIN,
+    PitchTracker,
+)
 from video_source import (
     download_youtube_video,
     is_youtube_url,
@@ -302,9 +313,9 @@ QCheckBox::indicator:checked {
 # Thread-Safe Video Worker
 # ---------------------------------------------------------------------------
 class VideoThread(QThread):
-    """Thread-safe OpenCV video playback and frame decoder."""
+    """Thread-safe video decoding and playback engine."""
 
-    frame_ready = Signal(np.ndarray, float, int, int)  # frame, timestamp_sec, curr_frame, total_frames
+    frame_ready = Signal(np.ndarray, float, int, int)
     stream_finished = Signal()
     error_occurred = Signal(str)
 
@@ -323,17 +334,14 @@ class VideoThread(QThread):
         self.mutex = QMutex()
 
     def set_playback_speed(self, speed: float):
-        """Set slow-motion or fast playback multiplier (e.g. 0.25, 0.5, 1.0)."""
         self.playback_speed = max(0.1, speed)
 
     def seek_frame(self, frame_idx: int):
-        """Thread-safe seek request queued for worker thread."""
         if not self.is_live and self.total_frames > 0:
             with QMutexLocker(self.mutex):
                 self._requested_seek_frame = max(0, min(self.total_frames - 1, frame_idx))
 
     def seek_relative_seconds(self, delta_sec: float):
-        """Rewind or fast forward relative to current position."""
         if not self.is_live and self.total_frames > 0:
             delta_frames = int(delta_sec * self.fps)
             target = self.current_frame_idx + delta_frames
@@ -358,7 +366,6 @@ class VideoThread(QThread):
                 self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
             while self.running:
-                # 1. Process thread-safe seek requests immediately
                 seek_target = None
                 with QMutexLocker(self.mutex):
                     if self._requested_seek_frame is not None:
@@ -372,18 +379,15 @@ class VideoThread(QThread):
                         self.current_frame_idx = seek_target
                         ts = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                         self.frame_ready.emit(frame, ts, self.current_frame_idx, self.total_frames)
-                        # Keep video pointer positioned at sought frame
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, seek_target)
                     if self.paused:
                         time.sleep(0.02)
                         continue
 
-                # 2. Check paused state
                 if self.paused and not self.is_live:
                     time.sleep(0.02)
                     continue
 
-                # 3. Read next frame
                 start_time = time.time()
                 ret, frame = self.cap.read()
 
@@ -427,9 +431,10 @@ class VideoThread(QThread):
 # Interactive Video Canvas
 # ---------------------------------------------------------------------------
 class VideoCanvas(QWidget):
-    """Video rendering canvas with strike zone, corridor, hollow reticle, and diagnostic view."""
+    """High-res video canvas with Strike Zone & Pitch Corridor interactive calibration."""
 
-    calibration_completed = Signal(list)
+    zone_calibrated = Signal(list)
+    corridor_calibrated = Signal(int, int, int, int)
     color_sampled = Signal(int, int)
 
     def __init__(self, parent=None):
@@ -446,11 +451,14 @@ class VideoCanvas(QWidget):
         self.ball_radius: int = 14
 
         # Modes
-        self.is_calibrating: bool = False
+        self.is_calibrating_zone: bool = False
+        self.is_calibrating_corridor: bool = False
         self.is_sampling_color: bool = False
         self.show_diagnostic_mask: bool = False
         self.show_corridor: bool = True
+
         self.calibration_points: List[Tuple[int, int]] = []
+        self.corridor_points: List[Tuple[int, int]] = []
 
         # Call alert overlay
         self.alert_text: str = ""
@@ -474,16 +482,26 @@ class VideoCanvas(QWidget):
         self.roi_box = roi_box
         self.update()
 
-    def start_calibration(self):
-        self.is_calibrating = True
+    def start_zone_calibration(self):
+        self.is_calibrating_zone = True
+        self.is_calibrating_corridor = False
         self.is_sampling_color = False
         self.calibration_points = []
-        self.trigger_alert("CALIBRATION: Click Top-Left Corner", QColor("#38bdf8"), duration_ms=2500)
+        self.trigger_alert("ZONE: Click 1/4 (Top-Left)", QColor("#38bdf8"), duration_ms=2500)
+        self.update()
+
+    def start_corridor_calibration(self):
+        self.is_calibrating_corridor = True
+        self.is_calibrating_zone = False
+        self.is_sampling_color = False
+        self.corridor_points = []
+        self.trigger_alert("CORRIDOR: Click Top-Left (Pitcher Release)", QColor("#38bdf8"), duration_ms=2500)
         self.update()
 
     def start_color_sampling(self):
         self.is_sampling_color = True
-        self.is_calibrating = False
+        self.is_calibrating_zone = False
+        self.is_calibrating_corridor = False
         self.trigger_alert("COLOR SAMPLER: Click directly on the ball", QColor("#f59e0b"), duration_ms=3000)
         self.update()
 
@@ -505,6 +523,7 @@ class VideoCanvas(QWidget):
                 fx = int((click_x - ox) / scale)
                 fy = int((click_y - oy) / scale)
 
+                # 1. Color Sampler
                 if self.is_sampling_color:
                     self.is_sampling_color = False
                     self.color_sampled.emit(fx, fy)
@@ -512,16 +531,33 @@ class VideoCanvas(QWidget):
                     self.update()
                     return
 
-                if self.is_calibrating:
+                # 2. Corridor Calibration
+                if self.is_calibrating_corridor:
+                    self.corridor_points.append((fx, fy))
+                    if len(self.corridor_points) == 1:
+                        self.trigger_alert("CORRIDOR: Click Bottom-Right (Plate)", QColor("#38bdf8"), duration_ms=2000)
+                    elif len(self.corridor_points) >= 2:
+                        self.is_calibrating_corridor = False
+                        p1, p2 = self.corridor_points[0], self.corridor_points[1]
+                        x1, x2 = min(p1[0], p2[0]), max(p1[0], p2[0])
+                        y1, y2 = min(p1[1], p2[1]), max(p1[1], p2[1])
+                        self.roi_box = (x1, y1, x2, y2)
+                        self.corridor_calibrated.emit(x1, y1, x2, y2)
+                        self.trigger_alert("Pitch Corridor Calibrated", QColor("#10b981"), duration_ms=2200)
+                    self.update()
+                    return
+
+                # 3. Strike Zone Calibration
+                if self.is_calibrating_zone:
                     self.calibration_points.append((fx, fy))
                     labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
                     if len(self.calibration_points) < 4:
                         next_lbl = labels[len(self.calibration_points)]
                         self.trigger_alert(f"Click {next_lbl} Corner", QColor("#38bdf8"), duration_ms=1800)
                     else:
-                        self.is_calibrating = False
+                        self.is_calibrating_zone = False
                         self.zone_polygon = np.array(self.calibration_points, dtype=np.int32)
-                        self.calibration_completed.emit(self.calibration_points)
+                        self.zone_calibrated.emit(self.calibration_points)
                         self.trigger_alert("Strike Zone Calibrated", QColor("#10b981"), duration_ms=2200)
                     self.update()
 
@@ -570,32 +606,32 @@ class VideoCanvas(QWidget):
         def to_widget(fx: float, fy: float) -> QPointF:
             return QPointF(ox + fx * scale, oy + fy * scale)
 
-        # 1. Pitch Corridor
-        if self.roi_box is not None and not self.is_calibrating and self.show_corridor:
+        # 1. Pitch Corridor Rectangle
+        if self.roi_box is not None and not self.is_calibrating_zone and self.show_corridor:
             rx1, ry1, rx2, ry2 = self.roi_box
             p_top_left = to_widget(rx1, ry1)
             p_bot_right = to_widget(rx2, ry2)
             roi_rect = QRectF(p_top_left, p_bot_right)
 
             painter.setBrush(Qt.NoBrush)
-            painter.setPen(QPen(QColor(56, 189, 248, 80), 1.5, Qt.DashLine))
+            painter.setPen(QPen(QColor(56, 189, 248, 120), 1.8, Qt.DashLine))
             painter.drawRect(roi_rect)
 
             painter.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
-            painter.setPen(QColor(56, 189, 248, 140))
-            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Pitch Corridor")
+            painter.setPen(QColor(56, 189, 248, 160))
+            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Active Pitch Corridor")
 
         # 2. Strike Zone Polygon & Grid
         poly_to_draw = (
             self.calibration_points
-            if self.is_calibrating
+            if self.is_calibrating_zone
             else (self.zone_polygon if self.zone_polygon is not None else None)
         )
 
         if poly_to_draw is not None and len(poly_to_draw) > 0:
             qpoly = QPolygon([to_widget(p[0], p[1]).toPoint() for p in poly_to_draw])
 
-            if len(poly_to_draw) == 4 and not self.is_calibrating:
+            if len(poly_to_draw) == 4 and not self.is_calibrating_zone:
                 painter.setBrush(QBrush(QColor(16, 185, 129, 45)))
                 painter.setPen(QPen(QColor(16, 185, 129, 220), 2.2, Qt.SolidLine))
                 painter.drawPolygon(qpoly)
@@ -615,7 +651,7 @@ class VideoCanvas(QWidget):
                     bot = QPointF(p3.x() + (p2.x() - p3.x()) * t, p3.y() + (p2.y() - p3.y()) * t)
                     painter.drawLine(top, bot)
 
-            elif self.is_calibrating:
+            elif self.is_calibrating_zone:
                 painter.setPen(QPen(QColor("#38bdf8"), 2, Qt.SolidLine))
                 for i in range(len(poly_to_draw)):
                     pt = to_widget(poly_to_draw[i][0], poly_to_draw[i][1])
@@ -853,7 +889,7 @@ class SourceSelectionDialog(QDialog):
         title.setFont(QFont("Segoe UI", 15, QFont.Bold))
         layout.addWidget(title)
 
-        subtitle = QLabel("Select live camera for match tracking, or test with a video file / YouTube link.")
+        subtitle = QLabel("Select live camera for match tracking, or test with HD video file / YouTube link.")
         subtitle.setStyleSheet("color: #94a3b8;")
         layout.addWidget(subtitle)
 
@@ -905,7 +941,7 @@ class SourceSelectionDialog(QDialog):
         yt_tab = QWidget()
         yt_layout = QVBoxLayout(yt_tab)
         yt_layout.setSpacing(10)
-        yt_label = QLabel("YouTube Video URL:")
+        yt_label = QLabel("YouTube Video URL (Downloads 1080p/720p HD):")
         self.yt_edit = QLineEdit()
         self.yt_edit.setPlaceholderText("https://www.youtube.com/watch?v=...")
 
@@ -916,7 +952,7 @@ class SourceSelectionDialog(QDialog):
         self.yt_progress.setValue(0)
         self.yt_progress.setVisible(False)
 
-        self.yt_btn = QPushButton("Fetch & Stream Video")
+        self.yt_btn = QPushButton("Fetch & Stream HD Video")
         self.yt_btn.setObjectName("PrimaryBtn")
         self.yt_btn.clicked.connect(self._fetch_youtube)
 
@@ -959,7 +995,7 @@ class SourceSelectionDialog(QDialog):
         self.yt_btn.setEnabled(False)
         self.yt_progress.setVisible(True)
         self.yt_progress.setValue(10)
-        self.yt_status.setText("Connecting to stream...")
+        self.yt_status.setText("Connecting to HD stream...")
         QApplication.processEvents()
 
         def _update_prog(pct, msg):
@@ -984,7 +1020,7 @@ class BlitzballMainWindow(QMainWindow):
     def __init__(self, initial_source: Optional[object] = None):
         super().__init__()
         self.setWindowTitle("Blitzball Pitch Tracker Pro")
-        self.resize(1340, 860)
+        self.resize(1360, 880)
         self.setStyleSheet(MODERN_STYLE_SHEET)
 
         self.game = GameState()
@@ -1021,14 +1057,15 @@ class BlitzballMainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         splitter.setHandleWidth(8)
 
-        # Left Column: Video Canvas + Complete Media Controls
+        # Left Column: Video Canvas + Media Controls
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
 
         self.canvas = VideoCanvas()
-        self.canvas.calibration_completed.connect(self._on_calibration_done)
+        self.canvas.zone_calibrated.connect(self._on_zone_calibrated)
+        self.canvas.corridor_calibrated.connect(self._on_corridor_calibrated)
         self.canvas.color_sampled.connect(self._on_color_sampled)
         left_layout.addWidget(self.canvas, stretch=1)
 
@@ -1053,28 +1090,22 @@ class BlitzballMainWindow(QMainWindow):
         playback_bar = QHBoxLayout()
         playback_bar.setSpacing(6)
 
-        # Rewind 3s
         self.btn_rewind = QPushButton("<< -3s")
         self.btn_rewind.clicked.connect(lambda: self.seek_relative(-3.0))
 
-        # Step Back
         self.btn_step_back = QPushButton("< Step")
         self.btn_step_back.clicked.connect(self.step_backward)
 
-        # Play/Pause
         self.btn_play_pause = QPushButton("Pause")
         self.btn_play_pause.setObjectName("PrimaryBtn")
         self.btn_play_pause.clicked.connect(self.toggle_playback)
 
-        # Step Forward
         self.btn_step_fwd = QPushButton("Step >")
         self.btn_step_fwd.clicked.connect(self.step_forward)
 
-        # Fast Forward 3s
         self.btn_forward = QPushButton("+3s >>")
         self.btn_forward.clicked.connect(lambda: self.seek_relative(3.0))
 
-        # Slow-Motion Playback Speed Selector
         self.speed_combo = QComboBox()
         self.speed_combo.addItem("1.0x (Normal)", 1.0)
         self.speed_combo.addItem("0.5x (Slow-Mo)", 0.5)
@@ -1082,9 +1113,11 @@ class BlitzballMainWindow(QMainWindow):
         self.speed_combo.addItem("1.5x (Fast)", 1.5)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
 
-        # Strike Zone & Color Actions
-        self.btn_calibrate = QPushButton("Calibrate Zone")
-        self.btn_calibrate.clicked.connect(self.canvas.start_calibration)
+        self.btn_cal_zone = QPushButton("Calibrate Zone")
+        self.btn_cal_zone.clicked.connect(self.canvas.start_zone_calibration)
+
+        self.btn_cal_corridor = QPushButton("Calibrate Corridor")
+        self.btn_cal_corridor.clicked.connect(self.canvas.start_corridor_calibration)
 
         self.btn_sample_color = QPushButton("Sample Ball Color")
         self.btn_sample_color.clicked.connect(self._start_sample_color)
@@ -1092,7 +1125,7 @@ class BlitzballMainWindow(QMainWindow):
         self.chk_show_mask = QCheckBox("Vision Mask")
         self.chk_show_mask.toggled.connect(self._toggle_show_mask)
 
-        self.btn_source = QPushButton("Change Source")
+        self.btn_source = QPushButton("Source")
         self.btn_source.clicked.connect(self.open_source_dialog)
 
         playback_bar.addWidget(self.btn_rewind)
@@ -1104,7 +1137,8 @@ class BlitzballMainWindow(QMainWindow):
         playback_bar.addWidget(QLabel("Speed:"))
         playback_bar.addWidget(self.speed_combo)
         playback_bar.addSpacing(6)
-        playback_bar.addWidget(self.btn_calibrate)
+        playback_bar.addWidget(self.btn_cal_zone)
+        playback_bar.addWidget(self.btn_cal_corridor)
         playback_bar.addWidget(self.btn_sample_color)
         playback_bar.addWidget(self.chk_show_mask)
         playback_bar.addStretch()
@@ -1176,68 +1210,87 @@ class BlitzballMainWindow(QMainWindow):
 
         right_tabs.addTab(deck_tab, "Umpire Deck")
 
-        # Tab 2: Tracking & Detection Settings
+        # Tab 2: Live Vision & Color Calibration Tuning
         tracking_tab = QWidget()
         tracking_layout = QVBoxLayout(tracking_tab)
-        tracking_layout.setSpacing(12)
+        tracking_layout.setSpacing(10)
 
-        # Color Presets & 1-Click Sampler
-        color_group = QGroupBox("Blitzball Color Calibration")
-        color_layout = QVBoxLayout(color_group)
+        # Color Preset & Sampler
+        preset_group = QGroupBox("Blitzball Color Preset & 1-Click Sampler")
+        preset_layout = QVBoxLayout(preset_group)
         self.color_combo = QComboBox()
         self.color_combo.addItem("Auto (Neon Green/Yellow + Light Blue)", "auto")
         self.color_combo.addItem("Neon Yellow / Green Only", "neon_green")
         self.color_combo.addItem("Light Blue Only", "light_blue")
         self.color_combo.currentIndexChanged.connect(self._on_color_mode_changed)
-        color_layout.addWidget(QLabel("Color Mode Presets:"))
-        color_layout.addWidget(self.color_combo)
+        preset_layout.addWidget(QLabel("Color Mode Presets:"))
+        preset_layout.addWidget(self.color_combo)
 
         btn_sample = QPushButton("Sample Ball Color from Video (Click on Ball)")
         btn_sample.clicked.connect(self._start_sample_color)
-        color_layout.addWidget(btn_sample)
+        preset_layout.addWidget(btn_sample)
 
-        self.color_status_lbl = QLabel("Active: Auto (Neon Green & Light Blue)")
+        self.color_status_lbl = QLabel("Active: Auto Preset (Neon Green & Light Blue)")
         self.color_status_lbl.setStyleSheet("color: #10b981;")
-        color_layout.addWidget(self.color_status_lbl)
+        preset_layout.addWidget(self.color_status_lbl)
+        tracking_layout.addWidget(preset_group)
 
-        btn_reset_color = QPushButton("Reset to Preset Defaults")
-        btn_reset_color.clicked.connect(self._reset_color_bounds)
-        color_layout.addWidget(btn_reset_color)
-        tracking_layout.addWidget(color_group)
+        # Live HSV Sliders Group
+        hsv_group = QGroupBox("Live Color Threshold Sliders (Tune with Vision Mask)")
+        hsv_layout = QVBoxLayout(hsv_group)
 
-        # Sensitivity / Strictness Slider
-        sens_group = QGroupBox("Detection Sensitivity")
-        sens_layout = QVBoxLayout(sens_group)
-        sens_layout.addWidget(QLabel("Sensitivity Slider (Zone Crossing Catch Rate):"))
-        self.sens_slider = QSlider(Qt.Horizontal)
-        self.sens_slider.setRange(1, 100)
-        self.sens_slider.setValue(75)
-        self.sens_slider.valueChanged.connect(self._on_sensitivity_changed)
-        sens_layout.addWidget(self.sens_slider)
+        # Hue Range
+        self.lbl_hue_range = QLabel("Hue Range (Color Shade): 22 - 88")
+        self.slider_h_min = QSlider(Qt.Horizontal)
+        self.slider_h_min.setRange(0, 179)
+        self.slider_h_min.setValue(DEFAULT_NEON_H_MIN)
+        self.slider_h_min.valueChanged.connect(self._on_hsv_slider_changed)
 
-        self.sens_status_lbl = QLabel("Sensitivity: 75% (High Catch Rate - Detects fast pitches crossing plate)")
-        self.sens_status_lbl.setStyleSheet("color: #38bdf8;")
-        sens_layout.addWidget(self.sens_status_lbl)
-        tracking_layout.addWidget(sens_group)
+        self.slider_h_max = QSlider(Qt.Horizontal)
+        self.slider_h_max.setRange(0, 179)
+        self.slider_h_max.setValue(DEFAULT_NEON_H_MAX)
+        self.slider_h_max.valueChanged.connect(self._on_hsv_slider_changed)
 
-        # Pitch Corridor Slider
-        roi_group = QGroupBox("Pitch Corridor Region (Ground Filter)")
-        roi_layout = QVBoxLayout(roi_group)
-        roi_layout.addWidget(QLabel("Corridor Width Expansion:"))
-        self.roi_slider = QSlider(Qt.Horizontal)
-        self.roi_slider.setRange(50, 200)
-        self.roi_slider.setValue(100)
-        self.roi_slider.valueChanged.connect(self._on_roi_slider_changed)
-        roi_layout.addWidget(self.roi_slider)
+        hsv_layout.addWidget(self.lbl_hue_range)
+        hsv_layout.addWidget(QLabel("Min Hue:"))
+        hsv_layout.addWidget(self.slider_h_min)
+        hsv_layout.addWidget(QLabel("Max Hue:"))
+        hsv_layout.addWidget(self.slider_h_max)
 
-        self.roi_status_lbl = QLabel("Width: 100% (Filters ground & sideline clutter)")
-        self.roi_status_lbl.setStyleSheet("color: #94a3b8;")
-        roi_layout.addWidget(self.roi_status_lbl)
+        # Saturation Min
+        self.lbl_s_min = QLabel("Min Saturation (Color Purity): 35")
+        self.slider_s_min = QSlider(Qt.Horizontal)
+        self.slider_s_min.setRange(0, 255)
+        self.slider_s_min.setValue(DEFAULT_NEON_S_MIN)
+        self.slider_s_min.valueChanged.connect(self._on_hsv_slider_changed)
+        hsv_layout.addWidget(self.lbl_s_min)
+        hsv_layout.addWidget(self.slider_s_min)
 
-        btn_recalc_roi = QPushButton("Reset Corridor to Strike Zone")
-        btn_recalc_roi.clicked.connect(self._reset_corridor)
-        roi_layout.addWidget(btn_recalc_roi)
-        tracking_layout.addWidget(roi_group)
+        # Value / Brightness Min
+        self.lbl_v_min = QLabel("Min Brightness / Value: 35")
+        self.slider_v_min = QSlider(Qt.Horizontal)
+        self.slider_v_min.setRange(0, 255)
+        self.slider_v_min.setValue(DEFAULT_NEON_V_MIN)
+        self.slider_v_min.valueChanged.connect(self._on_hsv_slider_changed)
+        hsv_layout.addWidget(self.lbl_v_min)
+        hsv_layout.addWidget(self.slider_v_min)
+
+        btn_reset_hsv = QPushButton("Reset Color Sliders to Defaults")
+        btn_reset_hsv.clicked.connect(self._reset_color_bounds)
+        hsv_layout.addWidget(btn_reset_hsv)
+        tracking_layout.addWidget(hsv_group)
+
+        # Pitch Corridor Calibration Group
+        corridor_group = QGroupBox("Pitch Corridor Calibration (Rejects Background & Umpires)")
+        corridor_layout = QVBoxLayout(corridor_group)
+        btn_recal_corridor = QPushButton("Calibrate Corridor Box (Release Window -> Plate)")
+        btn_recal_corridor.clicked.connect(self.canvas.start_corridor_calibration)
+        corridor_layout.addWidget(btn_recal_corridor)
+
+        btn_reset_corridor = QPushButton("Auto-Fit Corridor to Strike Zone")
+        btn_reset_corridor.clicked.connect(self._reset_corridor)
+        corridor_layout.addWidget(btn_reset_corridor)
+        tracking_layout.addWidget(corridor_group)
 
         tracking_layout.addStretch()
         right_tabs.addTab(tracking_tab, "Tracking Setup")
@@ -1286,7 +1339,7 @@ class BlitzballMainWindow(QMainWindow):
         right_tabs.addTab(stats_tab, "Box Score")
 
         splitter.addWidget(right_tabs)
-        splitter.setSizes([860, 440])
+        splitter.setSizes([880, 440])
         main_layout.addWidget(splitter, stretch=1)
 
         self._refresh_display()
@@ -1332,7 +1385,6 @@ class BlitzballMainWindow(QMainWindow):
             self.tracker = PitchTracker(
                 self.zone_polygon,
                 color_mode=self.ball_color_mode,
-                sensitivity=self.sens_slider.value(),
             )
 
     @Slot(np.ndarray, float, int, int)
@@ -1341,7 +1393,6 @@ class BlitzballMainWindow(QMainWindow):
             self.tracker = PitchTracker(
                 self.zone_polygon,
                 color_mode=self.ball_color_mode,
-                sensitivity=self.sens_slider.value(),
             )
 
         trajectory = []
@@ -1363,7 +1414,7 @@ class BlitzballMainWindow(QMainWindow):
 
         self.canvas.update_frame(frame, trajectory, self.zone_polygon, roi_box, diag_mask)
 
-        # Update Timeline Slider & Timecode (only if not actively dragging)
+        # Update Timeline Slider & Timecode (only if not dragging)
         if total_frames > 0 and not self.is_user_scrubbing:
             pct = int((curr_frame / total_frames) * 1000)
             self.timeline_slider.blockSignals(True)
@@ -1388,21 +1439,18 @@ class BlitzballMainWindow(QMainWindow):
         self.btn_play_pause.setText("Resume" if self.is_paused else "Pause")
 
     def seek_relative(self, seconds: float):
-        """Thread-safe rewind or fast forward."""
         if self.video_thread and not self.video_thread.is_live:
             if self.tracker:
                 self.tracker.reset()
             self.video_thread.seek_relative_seconds(seconds)
 
     def step_forward(self):
-        """Step forward 1 frame."""
         if self.video_thread and not self.video_thread.is_live:
             if not self.is_paused:
                 self.toggle_playback()
             self.video_thread.seek_frame(self.video_thread.current_frame_idx + 1)
 
     def step_backward(self):
-        """Step backward 1 frame."""
         if self.video_thread and not self.video_thread.is_live:
             if not self.is_paused:
                 self.toggle_playback()
@@ -1436,40 +1484,68 @@ class BlitzballMainWindow(QMainWindow):
 
     def _on_color_sampled(self, x: int, y: int):
         if self.canvas.current_frame is not None and self.tracker is not None:
-            lower, upper = self.tracker.sample_color_at_pixel(self.canvas.current_frame, x, y)
-            self.color_status_lbl.setText(f"Custom Calibrated (H:{lower[0]}-{upper[0]}, S:{lower[1]}+)")
+            h_min, h_max, s_min, v_min = self.tracker.sample_color_at_pixel(
+                self.canvas.current_frame, x, y
+            )
+            # Sync UI Sliders
+            self.slider_h_min.blockSignals(True)
+            self.slider_h_max.blockSignals(True)
+            self.slider_s_min.blockSignals(True)
+            self.slider_v_min.blockSignals(True)
+
+            self.slider_h_min.setValue(h_min)
+            self.slider_h_max.setValue(h_max)
+            self.slider_s_min.setValue(s_min)
+            self.slider_v_min.setValue(v_min)
+
+            self.slider_h_min.blockSignals(False)
+            self.slider_h_max.blockSignals(False)
+            self.slider_s_min.blockSignals(False)
+            self.slider_v_min.blockSignals(False)
+
+            self.lbl_hue_range.setText(f"Hue Range: {h_min} - {h_max}")
+            self.lbl_s_min.setText(f"Min Saturation: {s_min}")
+            self.lbl_v_min.setText(f"Min Brightness: {v_min}")
+
+            self.color_status_lbl.setText(f"Sampled Calibrated (Hue: {h_min}-{h_max}, Sat: {s_min}+)")
+            self.color_status_lbl.setStyleSheet("color: #38bdf8;")
+
+    def _on_hsv_slider_changed(self):
+        h_min = self.slider_h_min.value()
+        h_max = self.slider_h_max.value()
+        s_min = self.slider_s_min.value()
+        v_min = self.slider_v_min.value()
+
+        if h_min > h_max:
+            h_min = h_max
+
+        self.lbl_hue_range.setText(f"Hue Range: {h_min} - {h_max}")
+        self.lbl_s_min.setText(f"Min Saturation: {s_min}")
+        self.lbl_v_min.setText(f"Min Brightness: {v_min}")
+
+        if self.tracker is not None:
+            self.tracker.set_hsv_bounds(h_min, h_max, s_min, v_min)
+            self.color_status_lbl.setText(f"Custom Sliders Active (H: {h_min}-{h_max}, S: {s_min}+)")
             self.color_status_lbl.setStyleSheet("color: #38bdf8;")
 
     def _reset_color_bounds(self):
         if self.tracker is not None:
             self.tracker.reset_custom_color()
-            self.color_status_lbl.setText("Active: Auto (Neon Green & Light Blue)")
+            self.slider_h_min.setValue(self.tracker.h_min)
+            self.slider_h_max.setValue(self.tracker.h_max)
+            self.slider_s_min.setValue(self.tracker.s_min)
+            self.slider_v_min.setValue(self.tracker.v_min)
+            self.color_status_lbl.setText("Active: Preset Defaults")
             self.color_status_lbl.setStyleSheet("color: #10b981;")
 
     def _toggle_show_mask(self, checked: bool):
         self.canvas.show_diagnostic_mask = checked
         self.canvas.update()
 
-    def _on_sensitivity_changed(self, value: int):
-        if value >= 75:
-            lbl = f"Sensitivity: {value}% (High Catch Rate - Detects fast pitches crossing plate)"
-            color = "#38bdf8"
-        elif value >= 45:
-            lbl = f"Sensitivity: {value}% (Balanced Detection)"
-            color = "#10b981"
-        else:
-            lbl = f"Sensitivity: {value}% (Strict Filtering)"
-            color = "#f59e0b"
-
-        self.sens_status_lbl.setText(lbl)
-        self.sens_status_lbl.setStyleSheet(f"color: {color};")
-        if self.tracker is not None:
-            self.tracker.set_sensitivity(value)
-
     def _on_video_error(self, err_msg: str):
         QMessageBox.critical(self, "Video Error", f"Failed to process video:\n{err_msg}")
 
-    def _on_calibration_done(self, points: list):
+    def _on_zone_calibrated(self, points: list):
         self.zone_polygon = np.array(points, dtype=np.int32)
         if self.tracker is not None:
             self.tracker.set_strike_zone(self.zone_polygon)
@@ -1477,9 +1553,19 @@ class BlitzballMainWindow(QMainWindow):
             self.tracker = PitchTracker(
                 self.zone_polygon,
                 color_mode=self.ball_color_mode,
-                sensitivity=self.sens_slider.value(),
             )
         self._refresh_display()
+
+    def _on_corridor_calibrated(self, x1: int, y1: int, x2: int, y2: int):
+        if self.tracker is not None:
+            self.tracker.set_corridor_box(x1, y1, x2, y2)
+        self._refresh_display()
+
+    def _reset_corridor(self):
+        if self.tracker is not None and self.zone_polygon is not None:
+            self.tracker.set_strike_zone(self.zone_polygon)
+            self.canvas.roi_box = self.tracker.roi_box
+            self.canvas.update()
 
     def _on_color_mode_changed(self):
         mode = self.color_combo.currentData()
@@ -1487,32 +1573,6 @@ class BlitzballMainWindow(QMainWindow):
         if self.tracker is not None:
             self.tracker.set_color_mode(mode)
             self._reset_color_bounds()
-
-    def _on_roi_slider_changed(self, value: int):
-        scale = value / 100.0
-        self.roi_status_lbl.setText(f"Width: {value}%")
-        if self.tracker is not None and self.zone_polygon is not None:
-            pts = self.zone_polygon.reshape((-1, 2))
-            min_x, max_x = int(np.min(pts[:, 0])), int(np.max(pts[:, 0]))
-            min_y, max_y = int(np.min(pts[:, 1])), int(np.max(pts[:, 1]))
-            w = max_x - min_x
-            h = max_y - min_y
-
-            margin_x = int(w * 1.2 * scale)
-            margin_top = int(h * 3.5 * scale)
-            margin_bottom = int(h * 0.4)
-
-            rx1 = max(0, min_x - margin_x)
-            ry1 = max(0, min_y - margin_top)
-            rx2 = max_x + margin_x
-            ry2 = max_y + margin_bottom
-
-            self.tracker.roi_box = (rx1, ry1, rx2, ry2)
-
-    def _reset_corridor(self):
-        if self.tracker is not None and self.zone_polygon is not None:
-            self.tracker.set_strike_zone(self.zone_polygon)
-            self.roi_slider.setValue(100)
 
     # -----------------------------------------------------------------------
     # Game Logic & Events

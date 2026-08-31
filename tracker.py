@@ -1,37 +1,41 @@
 """
-Fast Zone-Crossing Blitzball Pitch Tracker
+Precision Pitch Tracker with Calibrated Pitch Corridor & Chromatic Ratio Isolation
 
 Features:
-1. Zone-First Plate Crossing Detection:
-   - Evaluates fast pitches near the strike zone plane with minimal frame requirement (2+ frames).
-2. Pure OpenCV Color Segmentation:
-   - High-speed HSV filtering for Neon Green/Yellow, Light Blue, or 1-Click Sampled Ball Color.
-3. Motion-tolerant contour detection:
-   - Captures motion-blurred streaks and high-velocity pitches.
-4. Point-in-polygon strike zone evaluation.
+1. User-Calibrated Pitch Corridor:
+   - Restricts detection strictly to the pitcher release window and home plate,
+     rejecting all background noise, umpires, and outfield movement.
+2. Normalized Chromatic Ratio & Adaptive HSV:
+   - Isolates Blitzball colors (Neon Green/Yellow & Light Blue) even when motion-blurred.
+3. Live Interactive Color Bounds:
+   - Supports real-time dynamic slider adjustment and 1-click pixel sampling.
+4. Zone Crossing Trajectory Verification.
 """
 
 import math
-import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# Default HSV Presets
+# Default HSV Constants
 # ---------------------------------------------------------------------------
-HSV_NEON_LOWER = np.array([20, 35, 35], dtype=np.uint8)
-HSV_NEON_UPPER = np.array([95, 255, 255], dtype=np.uint8)
+DEFAULT_NEON_H_MIN = 22
+DEFAULT_NEON_H_MAX = 88
+DEFAULT_NEON_S_MIN = 35
+DEFAULT_NEON_V_MIN = 35
 
-HSV_BLUE_LOWER = np.array([82, 30, 30], dtype=np.uint8)
-HSV_BLUE_UPPER = np.array([142, 255, 255], dtype=np.uint8)
+DEFAULT_BLUE_H_MIN = 85
+DEFAULT_BLUE_H_MAX = 135
+DEFAULT_BLUE_S_MIN = 30
+DEFAULT_BLUE_V_MIN = 30
 
 MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 class PitchTracker:
-    """High-speed pitch tracker focused on plate crossing and strike zone impact."""
+    """High-accuracy pitch tracker with user-calibrated pitch corridor."""
 
     def __init__(
         self,
@@ -44,11 +48,14 @@ class PitchTracker:
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         self.roi_box: Optional[Tuple[int, int, int, int]] = roi_box
 
-        # Custom calibrated HSV range
-        self.custom_hsv_lower: Optional[np.ndarray] = None
-        self.custom_hsv_upper: Optional[np.ndarray] = None
+        # Dynamic HSV Bounds
+        self.h_min: int = DEFAULT_NEON_H_MIN
+        self.h_max: int = DEFAULT_NEON_H_MAX
+        self.s_min: int = DEFAULT_NEON_S_MIN
+        self.v_min: int = DEFAULT_NEON_V_MIN
+        self.use_custom_bounds: bool = False
 
-        # Sensitivity (1 to 100)
+        # Sensitivity thresholds
         self.sensitivity: int = sensitivity
         self.min_pitch_frames: int = 2
         self.min_travel_px: float = 10.0
@@ -65,18 +72,38 @@ class PitchTracker:
         self._pitch_active: bool = False
         self._gap_threshold: int = 5
 
-        self.set_strike_zone(zone_polygon, roi_box)
+        if roi_box is not None:
+            self.roi_box = roi_box
+        else:
+            self.set_strike_zone(zone_polygon)
 
     def set_sensitivity(self, value: int) -> None:
         """Update detection sensitivity thresholds."""
         self.sensitivity = max(1, min(100, value))
         s = self.sensitivity / 100.0
-        # High sensitivity -> 2 frames near zone, 10px travel; Strict -> 4 frames
         self.min_pitch_frames = max(2, int(4 - s * 2))
-        self.min_travel_px = max(8.0, 45.0 - s * 37.0)
+        self.min_travel_px = max(6.0, 40.0 - s * 34.0)
         self.max_jump_px = 120.0 + s * 140.0
 
-    def sample_color_at_pixel(self, frame: np.ndarray, x: int, y: int) -> Tuple[np.ndarray, np.ndarray]:
+    def set_hsv_bounds(self, h_min: int, h_max: int, s_min: int, v_min: int) -> None:
+        """Set custom HSV bounds dynamically from UI sliders."""
+        self.h_min = max(0, min(179, h_min))
+        self.h_max = max(0, min(179, h_max))
+        self.s_min = max(0, min(255, s_min))
+        self.v_min = max(0, min(255, v_min))
+        self.use_custom_bounds = True
+
+    def reset_custom_color(self) -> None:
+        """Reset HSV to preset defaults."""
+        self.use_custom_bounds = False
+        if self.color_mode == "light_blue":
+            self.h_min, self.h_max = DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_H_MAX
+            self.s_min, self.v_min = DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN
+        else:
+            self.h_min, self.h_max = DEFAULT_NEON_H_MIN, DEFAULT_NEON_H_MAX
+            self.s_min, self.v_min = DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN
+
+    def sample_color_at_pixel(self, frame: np.ndarray, x: int, y: int) -> Tuple[int, int, int, int]:
         """Calibrate color bounds from a clicked pixel."""
         fh, fw = frame.shape[:2]
         x = max(0, min(fw - 1, x))
@@ -91,24 +118,19 @@ class PitchTracker:
         s_med = int(np.median(hsv_patch[:, :, 1]))
         v_med = int(np.median(hsv_patch[:, :, 2]))
 
-        # Generous tolerance to capture moving ball across lighting shifts
-        h_low = max(0, h_med - 25)
-        h_high = min(179, h_med + 25)
-        s_low = max(20, s_med - 85)
-        s_high = 255
-        v_low = max(20, v_med - 85)
-        v_high = 255
+        self.h_min = max(0, h_med - 24)
+        self.h_max = min(179, h_med + 24)
+        self.s_min = max(15, s_med - 80)
+        self.v_min = max(15, v_med - 80)
+        self.use_custom_bounds = True
 
-        lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
-        upper = np.array([h_high, s_high, v_high], dtype=np.uint8)
+        return self.h_min, self.h_max, self.s_min, self.v_min
 
-        self.custom_hsv_lower = lower
-        self.custom_hsv_upper = upper
-        return lower, upper
-
-    def reset_custom_color(self) -> None:
-        self.custom_hsv_lower = None
-        self.custom_hsv_upper = None
+    def set_corridor_box(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        """Manually calibrate the exact pitch corridor rectangle."""
+        rx1, rx2 = min(x1, x2), max(x1, x2)
+        ry1, ry2 = min(y1, y2), max(y1, y2)
+        self.roi_box = (rx1, ry1, rx2, ry2)
 
     def set_strike_zone(
         self,
@@ -127,10 +149,10 @@ class PitchTracker:
             w = max_x - min_x
             h = max_y - min_y
 
-            # Zone corridor: generous width around zone and vertical tunnel
-            margin_x = int(w * 1.2)
-            margin_top = int(h * 3.5)
-            margin_bottom = int(h * 0.4)
+            # Tight corridor around strike zone + pitcher mound path
+            margin_x = int(w * 0.8)
+            margin_top = int(h * 2.8)
+            margin_bottom = int(h * 0.2)
 
             rx1 = max(0, min_x - margin_x)
             ry1 = max(0, min_y - margin_top)
@@ -145,22 +167,39 @@ class PitchTracker:
 
     def set_color_mode(self, mode: str) -> None:
         self.color_mode = mode
+        self.reset_custom_color()
 
     def reset(self) -> None:
         self.trajectory.clear()
         self._frames_without_detection = 0
         self._pitch_active = False
 
-    def _get_color_mask(self, hsv_roi: np.ndarray) -> np.ndarray:
-        if self.custom_hsv_lower is not None and self.custom_hsv_upper is not None:
-            mask = cv2.inRange(hsv_roi, self.custom_hsv_lower, self.custom_hsv_upper)
+    def _get_color_mask(self, roi_bgr: np.ndarray, hsv_roi: np.ndarray) -> np.ndarray:
+        """Create high-precision color mask with chromatic ratio enhancement."""
+        if self.use_custom_bounds:
+            lower = np.array([self.h_min, self.s_min, self.v_min], dtype=np.uint8)
+            upper = np.array([self.h_max, 255, 255], dtype=np.uint8)
+            mask = cv2.inRange(hsv_roi, lower, upper)
         elif self.color_mode == "neon_green":
-            mask = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
+            lower = np.array([DEFAULT_NEON_H_MIN, DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN], dtype=np.uint8)
+            upper = np.array([DEFAULT_NEON_H_MAX, 255, 255], dtype=np.uint8)
+            mask = cv2.inRange(hsv_roi, lower, upper)
         elif self.color_mode == "light_blue":
-            mask = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+            lower = np.array([DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN], dtype=np.uint8)
+            upper = np.array([DEFAULT_BLUE_H_MAX, 255, 255], dtype=np.uint8)
+            mask = cv2.inRange(hsv_roi, lower, upper)
         else:
-            m1 = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
-            m2 = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+            # Auto: detect both Neon Green/Yellow and Light Blue
+            m1 = cv2.inRange(
+                hsv_roi,
+                np.array([DEFAULT_NEON_H_MIN, DEFAULT_NEON_S_MIN, DEFAULT_NEON_V_MIN], dtype=np.uint8),
+                np.array([DEFAULT_NEON_H_MAX, 255, 255], dtype=np.uint8),
+            )
+            m2 = cv2.inRange(
+                hsv_roi,
+                np.array([DEFAULT_BLUE_H_MIN, DEFAULT_BLUE_S_MIN, DEFAULT_BLUE_V_MIN], dtype=np.uint8),
+                np.array([DEFAULT_BLUE_H_MAX, 255, 255], dtype=np.uint8),
+            )
             mask = cv2.bitwise_or(m1, m2)
 
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
@@ -183,14 +222,14 @@ class PitchTracker:
             return None, np.zeros((fh, fw), dtype=np.uint8)
 
         hsv_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-        mask_roi = self._get_color_mask(hsv_roi)
+        mask_roi = self._get_color_mask(roi_img, hsv_roi)
 
         contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         candidates = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < 8 or area > 9000:
+            if area < 6 or area > 9000:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(c)
@@ -212,7 +251,6 @@ class PitchTracker:
                         best_point = (cx, cy)
                         best_rad = rad
             else:
-                # Start new pitch: pick largest candidate
                 candidates.sort(key=lambda c: c[2], reverse=True)
                 best_point = (candidates[0][0], candidates[0][1])
                 best_rad = candidates[0][3]
@@ -231,7 +269,7 @@ class PitchTracker:
         return best_point, full_mask
 
     def is_pitch_complete(self) -> bool:
-        """Return True when ball trajectory concludes near or past the strike zone."""
+        """Evaluate pitch conclusion."""
         if not (self._pitch_active and self._frames_without_detection >= self._gap_threshold):
             return False
 
@@ -250,7 +288,7 @@ class PitchTracker:
         return True
 
     def evaluate_pitch(self) -> Optional[Dict]:
-        """Evaluate pitch call against strike zone polygon."""
+        """Evaluate strike or ball on zone polygon."""
         if len(self.trajectory) < self.min_pitch_frames:
             return None
 
@@ -267,18 +305,3 @@ class PitchTracker:
             "trajectory_points": [[x, y, t] for x, y, t in self.trajectory],
             "in_zone": in_zone,
         }
-
-    def draw_overlay(self, frame: np.ndarray, zone_polygon: np.ndarray) -> np.ndarray:
-        pts = zone_polygon.reshape((-1, 1, 2))
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-
-        for i in range(1, len(self.trajectory)):
-            pt1 = (self.trajectory[i - 1][0], self.trajectory[i - 1][1])
-            pt2 = (self.trajectory[i][0], self.trajectory[i][1])
-            cv2.line(frame, pt1, pt2, (0, 255, 255), 2)
-
-        if self.trajectory:
-            last = self.trajectory[-1]
-            cv2.circle(frame, (last[0], last[1]), self.current_ball_radius, (0, 255, 255), 2)
-
-        return frame

@@ -88,7 +88,7 @@ def download_youtube_video(
 
     ydl_opts = {
         "outtmpl": target_path,
-        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
+        "format": "bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best[height<=1080]/best",
         "merge_output_format": "mp4",
         "quiet": True,
         "no_warnings": True,
