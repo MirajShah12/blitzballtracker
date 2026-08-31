@@ -34,6 +34,36 @@ def main() -> None:
         help="Camera device index for real-time match tracking (e.g. 0).",
     )
     parser.add_argument(
+        "--motion-thresh",
+        type=int,
+        default=18,
+        help="Motion sensitivity threshold for frame differencing (5-60, default 18).",
+    )
+    parser.add_argument(
+        "--min-area",
+        type=int,
+        default=25,
+        help="Minimum ball contour area in pixels (default 25).",
+    )
+    parser.add_argument(
+        "--max-area",
+        type=int,
+        default=1800,
+        help="Maximum ball contour area in pixels (default 1800).",
+    )
+    parser.add_argument(
+        "--min-circ",
+        type=float,
+        default=0.35,
+        help="Minimum circularity threshold to reject flat plates (default 0.35).",
+    )
+    parser.add_argument(
+        "--sensitivity",
+        type=int,
+        default=75,
+        help="Overall pitch detection sensitivity (1-100, default 75).",
+    )
+    parser.add_argument(
         "--cli",
         action="store_true",
         help="Run in legacy terminal/OpenCV window mode instead of full desktop GUI.",

@@ -3,11 +3,13 @@ Blitzball Pitch Tracker Pro - Professional Broadcast Interface (PySide6)
 
 Features:
 - High-Definition Video Feed (1080p60/720p60 stream support).
+- Motion-First Masking (cv2.absdiff): zeros out static home plate, strike zone markings, and background terrain.
+- Physical & Morphological Contour Constraints (area bounds, circularity, aspect ratio).
+- Kalman Velocity Gating: velocity limits, direction vector verification, and Kalman state estimation.
 - 100% Thread-safe Video Engine with instant Rewind (-3s), Fast Forward (+3s), Step Back/Forward, and Live Timeline Scrubbing.
 - Slow-Motion & Playback Speed Control (0.25x Super Slow, 0.5x Slow-Mo, 1.0x Normal, 1.5x Fast).
 - Interactive 2-Click Pitch Corridor Calibration (Release Window -> Plate).
 - Interactive Live HSV Sliders & 1-Click Color Eyedropper with Live Vision Mask.
-- Zone-First Plate Crossing Ball Tracker.
 - Official Blitzball 5-ball walk & 2-lob rules.
 - Live box scores and pitch logs.
 """
@@ -82,6 +84,10 @@ from tracker import (
     DEFAULT_BLUE_H_MIN,
     DEFAULT_BLUE_S_MIN,
     DEFAULT_BLUE_V_MIN,
+    DEFAULT_MAX_BALL_AREA,
+    DEFAULT_MIN_BALL_AREA,
+    DEFAULT_MIN_CIRCULARITY,
+    DEFAULT_MOTION_THRESH,
     DEFAULT_NEON_H_MAX,
     DEFAULT_NEON_H_MIN,
     DEFAULT_NEON_S_MIN,
@@ -523,7 +529,6 @@ class VideoCanvas(QWidget):
                 fx = int((click_x - ox) / scale)
                 fy = int((click_y - oy) / scale)
 
-                # 1. Color Sampler
                 if self.is_sampling_color:
                     self.is_sampling_color = False
                     self.color_sampled.emit(fx, fy)
@@ -531,7 +536,6 @@ class VideoCanvas(QWidget):
                     self.update()
                     return
 
-                # 2. Corridor Calibration
                 if self.is_calibrating_corridor:
                     self.corridor_points.append((fx, fy))
                     if len(self.corridor_points) == 1:
@@ -547,7 +551,6 @@ class VideoCanvas(QWidget):
                     self.update()
                     return
 
-                # 3. Strike Zone Calibration
                 if self.is_calibrating_zone:
                     self.calibration_points.append((fx, fy))
                     labels = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
@@ -594,7 +597,7 @@ class VideoCanvas(QWidget):
 
         if self.show_diagnostic_mask and self.diagnostic_mask is not None:
             mask_rgb = cv2.cvtColor(self.diagnostic_mask, cv2.COLOR_GRAY2RGB)
-            mask_rgb[:, :, 0] = 0  # Green-cyan tint
+            mask_rgb[:, :, 0] = 0  # Green-cyan tint for motion x color
             qimg = QImage(mask_rgb.data, fw, fh, 3 * fw, QImage.Format_RGB888)
         else:
             rgb_frame = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
@@ -1210,13 +1213,55 @@ class BlitzballMainWindow(QMainWindow):
 
         right_tabs.addTab(deck_tab, "Umpire Deck")
 
-        # Tab 2: Live Vision & Color Calibration Tuning
+        # Tab 2: Live Vision & Filter Calibration Tuning
         tracking_tab = QWidget()
         tracking_layout = QVBoxLayout(tracking_tab)
         tracking_layout.setSpacing(10)
 
+        # Motion Differencing & Constraints Group
+        motion_group = QGroupBox("1. Motion-First Masking & Constraints (Zeros Static Elements)")
+        motion_layout = QVBoxLayout(motion_group)
+
+        # Motion Threshold
+        self.lbl_motion_thresh = QLabel("Motion Sensitivity Threshold (cv2.absdiff): 18")
+        self.slider_motion = QSlider(Qt.Horizontal)
+        self.slider_motion.setRange(5, 50)
+        self.slider_motion.setValue(DEFAULT_MOTION_THRESH)
+        self.slider_motion.valueChanged.connect(self._on_motion_slider_changed)
+        motion_layout.addWidget(self.lbl_motion_thresh)
+        motion_layout.addWidget(self.slider_motion)
+
+        # Min / Max Area
+        self.lbl_area_bounds = QLabel(f"Ball Area Bounds: {DEFAULT_MIN_BALL_AREA} - {DEFAULT_MAX_BALL_AREA} px²")
+        self.slider_min_area = QSlider(Qt.Horizontal)
+        self.slider_min_area.setRange(5, 100)
+        self.slider_min_area.setValue(DEFAULT_MIN_BALL_AREA)
+        self.slider_min_area.valueChanged.connect(self._on_area_slider_changed)
+
+        self.slider_max_area = QSlider(Qt.Horizontal)
+        self.slider_max_area.setRange(200, 3500)
+        self.slider_max_area.setValue(DEFAULT_MAX_BALL_AREA)
+        self.slider_max_area.valueChanged.connect(self._on_area_slider_changed)
+
+        motion_layout.addWidget(self.lbl_area_bounds)
+        motion_layout.addWidget(QLabel("Min Ball Area:"))
+        motion_layout.addWidget(self.slider_min_area)
+        motion_layout.addWidget(QLabel("Max Ball Area:"))
+        motion_layout.addWidget(self.slider_max_area)
+
+        # Circularity Check
+        self.lbl_circ = QLabel(f"Min Circularity (Flat Base / Plate Rejection): {DEFAULT_MIN_CIRCULARITY:.2f}")
+        self.slider_circ = QSlider(Qt.Horizontal)
+        self.slider_circ.setRange(10, 80)
+        self.slider_circ.setValue(int(DEFAULT_MIN_CIRCULARITY * 100))
+        self.slider_circ.valueChanged.connect(self._on_circ_slider_changed)
+        motion_layout.addWidget(self.lbl_circ)
+        motion_layout.addWidget(self.slider_circ)
+
+        tracking_layout.addWidget(motion_group)
+
         # Color Preset & Sampler
-        preset_group = QGroupBox("Blitzball Color Preset & 1-Click Sampler")
+        preset_group = QGroupBox("2. Blitzball Color Preset & 1-Click Sampler")
         preset_layout = QVBoxLayout(preset_group)
         self.color_combo = QComboBox()
         self.color_combo.addItem("Auto (Neon Green/Yellow + Light Blue)", "auto")
@@ -1236,11 +1281,11 @@ class BlitzballMainWindow(QMainWindow):
         tracking_layout.addWidget(preset_group)
 
         # Live HSV Sliders Group
-        hsv_group = QGroupBox("Live Color Threshold Sliders (Tune with Vision Mask)")
+        hsv_group = QGroupBox("3. Color Threshold Sliders (HSV)")
         hsv_layout = QVBoxLayout(hsv_group)
 
         # Hue Range
-        self.lbl_hue_range = QLabel("Hue Range (Color Shade): 22 - 88")
+        self.lbl_hue_range = QLabel(f"Hue Range: {DEFAULT_NEON_H_MIN} - {DEFAULT_NEON_H_MAX}")
         self.slider_h_min = QSlider(Qt.Horizontal)
         self.slider_h_min.setRange(0, 179)
         self.slider_h_min.setValue(DEFAULT_NEON_H_MIN)
@@ -1258,7 +1303,7 @@ class BlitzballMainWindow(QMainWindow):
         hsv_layout.addWidget(self.slider_h_max)
 
         # Saturation Min
-        self.lbl_s_min = QLabel("Min Saturation (Color Purity): 35")
+        self.lbl_s_min = QLabel(f"Min Saturation: {DEFAULT_NEON_S_MIN}")
         self.slider_s_min = QSlider(Qt.Horizontal)
         self.slider_s_min.setRange(0, 255)
         self.slider_s_min.setValue(DEFAULT_NEON_S_MIN)
@@ -1267,7 +1312,7 @@ class BlitzballMainWindow(QMainWindow):
         hsv_layout.addWidget(self.slider_s_min)
 
         # Value / Brightness Min
-        self.lbl_v_min = QLabel("Min Brightness / Value: 35")
+        self.lbl_v_min = QLabel(f"Min Brightness / Value: {DEFAULT_NEON_V_MIN}")
         self.slider_v_min = QSlider(Qt.Horizontal)
         self.slider_v_min.setRange(0, 255)
         self.slider_v_min.setValue(DEFAULT_NEON_V_MIN)
@@ -1281,7 +1326,7 @@ class BlitzballMainWindow(QMainWindow):
         tracking_layout.addWidget(hsv_group)
 
         # Pitch Corridor Calibration Group
-        corridor_group = QGroupBox("Pitch Corridor Calibration (Rejects Background & Umpires)")
+        corridor_group = QGroupBox("4. Pitch Corridor Calibration (Rejects Outfield & Umpires)")
         corridor_layout = QVBoxLayout(corridor_group)
         btn_recal_corridor = QPushButton("Calibrate Corridor Box (Release Window -> Plate)")
         btn_recal_corridor.clicked.connect(self.canvas.start_corridor_calibration)
@@ -1509,6 +1554,27 @@ class BlitzballMainWindow(QMainWindow):
 
             self.color_status_lbl.setText(f"Sampled Calibrated (Hue: {h_min}-{h_max}, Sat: {s_min}+)")
             self.color_status_lbl.setStyleSheet("color: #38bdf8;")
+
+    def _on_motion_slider_changed(self):
+        val = self.slider_motion.value()
+        self.lbl_motion_thresh.setText(f"Motion Sensitivity Threshold (cv2.absdiff): {val}")
+        if self.tracker:
+            self.tracker.set_motion_threshold(val)
+
+    def _on_area_slider_changed(self):
+        min_a = self.slider_min_area.value()
+        max_a = self.slider_max_area.value()
+        if min_a >= max_a:
+            min_a = max_a - 10
+        self.lbl_area_bounds.setText(f"Ball Area Bounds: {min_a} - {max_a} px²")
+        if self.tracker:
+            self.tracker.set_area_bounds(min_a, max_a)
+
+    def _on_circ_slider_changed(self):
+        circ = self.slider_circ.value() / 100.0
+        self.lbl_circ.setText(f"Min Circularity (Flat Base / Plate Rejection): {circ:.2f}")
+        if self.tracker:
+            self.tracker.set_circularity_bound(circ)
 
     def _on_hsv_slider_changed(self):
         h_min = self.slider_h_min.value()
