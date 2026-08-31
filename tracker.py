@@ -1,16 +1,11 @@
 """
-Advanced Blitzball Pitch Tracker & Video Distortion Engine
+Simplified High-Speed Blitzball Pitch Tracker
 
-Features:
-1. Chromatic Color Contrast Amplification:
-   - Mathematical color-difference transform (2G - R - B for neon green/yellow,
-     2B - R - G for light blue) turns the background black and illuminates the Blitzball.
-2. CLAHE Adaptive Contrast Equalization:
-   - Normalizes harsh sunlight and heavy shadows.
-3. Interactive Live Color Calibration:
-   - Real-time custom HSV range adjustment and 1-click pixel sampling.
-4. Dual Detection Engine (YOLOv8 AI + Chromatic CV).
-5. Dynamic Sensitivity & Trajectory Physics Verification.
+Designed for maximum performance and stability:
+1. Pure OpenCV color segmentation (Neon Green, Light Blue, or 1-Click Calibrated Color).
+2. Restricted Pitch Corridor ROI (ignores ground, sky, and sideline clutter).
+3. Motion-tolerant blob detection (robust against motion blur and oblong shapes).
+4. Smooth trajectory accumulation and point-in-polygon strike zone evaluation.
 """
 
 import math
@@ -20,128 +15,88 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except Exception:
-    YOLO = None
-    YOLO_AVAILABLE = False
-
-
 # ---------------------------------------------------------------------------
-# Default HSV Bounds
+# Default HSV Presets
 # ---------------------------------------------------------------------------
-DEFAULT_NEON_LOWER = np.array([18, 40, 40])
-DEFAULT_NEON_UPPER = np.array([92, 255, 255])
+# Neon Green / Neon Yellow
+HSV_NEON_LOWER = np.array([20, 45, 45], dtype=np.uint8)
+HSV_NEON_UPPER = np.array([92, 255, 255], dtype=np.uint8)
 
-DEFAULT_BLUE_LOWER = np.array([84, 35, 35])
-DEFAULT_BLUE_UPPER = np.array([140, 255, 255])
+# Light Blue
+HSV_BLUE_LOWER = np.array([85, 40, 40], dtype=np.uint8)
+HSV_BLUE_UPPER = np.array([138, 255, 255], dtype=np.uint8)
 
-MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
 class PitchTracker:
-    """Intelligent pitch tracker with Chromatic Contrast Amplification and live diagnostic masking."""
+    """Fast, lightweight tracker that tracks moving Blitzballs without heavy overhead."""
 
     def __init__(
         self,
         zone_polygon: np.ndarray,
         color_mode: str = "auto",
         roi_box: Optional[Tuple[int, int, int, int]] = None,
-        use_yolo: bool = True,
         sensitivity: int = 75,
     ):
         self.color_mode = color_mode
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         self.roi_box: Optional[Tuple[int, int, int, int]] = roi_box
 
-        # Custom HSV range overrides (for interactive tuning)
+        # Custom calibrated HSV range
         self.custom_hsv_lower: Optional[np.ndarray] = None
         self.custom_hsv_upper: Optional[np.ndarray] = None
 
-        # Sensitivity: 1 (Strict) to 100 (Ultra Sensitive)
+        # Sensitivity (1 to 100)
         self.sensitivity: int = sensitivity
-        self._apply_sensitivity_parameters()
-
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        self.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        self.min_pitch_frames: int = 3
+        self.min_travel_px: float = 20.0
+        self.max_jump_px: float = 180.0
+        self.set_sensitivity(sensitivity)
 
         # Trajectory points: [(x, y, timestamp)]
         self.trajectory: List[Tuple[int, int, float]] = []
         self.current_ball_radius: int = 14
 
-        # YOLO AI Model
-        self.use_yolo = use_yolo and YOLO_AVAILABLE
-        self.yolo_model = None
-        if self.use_yolo:
-            try:
-                self.yolo_model = YOLO("yolov8n.pt")
-            except Exception:
-                self.use_yolo = False
-                self.yolo_model = None
-
-        # Temporal difference state
-        self.prev_roi_gray: Optional[np.ndarray] = None
-
-        # Physical trajectory tracking
+        # State tracking
         self.last_pitch_timestamp: float = -999.0
         self._frames_without_detection: int = 0
         self._pitch_active: bool = False
         self._gap_threshold: int = 6
 
-        # Kalman Filter
-        self._init_kalman()
         self.set_strike_zone(zone_polygon, roi_box)
 
-    def _apply_sensitivity_parameters(self) -> None:
-        """Calculate dynamic thresholds based on sensitivity slider (1-100)."""
-        s = max(1, min(100, self.sensitivity)) / 100.0
-
-        # Confidence: High sensitivity -> 0.08, Strict -> 0.35
-        self.yolo_conf = max(0.06, 0.35 - s * 0.28)
-
-        # Minimum continuous frames: High sensitivity -> 3, Strict -> 6
-        self.min_pitch_frames = max(3, int(6 - s * 3))
-
-        # Minimum vertical travel: High sensitivity -> 15px, Strict -> 75px
-        self.min_vertical_travel = max(15.0, 75.0 - s * 60.0)
-
-        # Max frame-to-frame jump: High sensitivity -> 180px, Strict -> 90px
-        self.max_frame_displacement = 90.0 + s * 90.0
-
-        # Anti-spam cooldown: High sensitivity -> 1.2s, Strict -> 2.5s
-        self.pitch_cooldown = max(1.2, 2.5 - s * 1.3)
-
     def set_sensitivity(self, value: int) -> None:
-        self.sensitivity = value
-        self._apply_sensitivity_parameters()
-
-    def set_custom_hsv(self, lower: np.ndarray, upper: np.ndarray) -> None:
-        """Set user-adjusted HSV bounds."""
-        self.custom_hsv_lower = lower
-        self.custom_hsv_upper = upper
+        """Update detection sensitivity thresholds."""
+        self.sensitivity = max(1, min(100, value))
+        s = self.sensitivity / 100.0
+        # Highly sensitive -> 3 frames, 15px travel; Strict -> 5 frames, 60px travel
+        self.min_pitch_frames = max(2, int(5 - s * 3))
+        self.min_travel_px = max(12.0, 60.0 - s * 48.0)
+        self.max_jump_px = 100.0 + s * 120.0
 
     def sample_color_at_pixel(self, frame: np.ndarray, x: int, y: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Sample pixel color and construct a tuned HSV tolerance range."""
+        """Calibrate color bounds from a clicked pixel."""
         fh, fw = frame.shape[:2]
         x = max(0, min(fw - 1, x))
         y = max(0, min(fh - 1, y))
 
-        # Sample a 5x5 neighborhood around the click for stability
-        x1, y1 = max(0, x - 2), max(0, y - 2)
-        x2, y2 = min(fw, x + 3), min(fh, y + 3)
+        # Sample 7x7 patch around click
+        x1, y1 = max(0, x - 3), max(0, y - 3)
+        x2, y2 = min(fw, x + 4), min(fh, y + 4)
         patch = frame[y1:y2, x1:x2]
 
         hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        h_mean = int(np.median(hsv_patch[:, :, 0]))
-        s_mean = int(np.median(hsv_patch[:, :, 1]))
-        v_mean = int(np.median(hsv_patch[:, :, 2]))
+        h_med = int(np.median(hsv_patch[:, :, 0]))
+        s_med = int(np.median(hsv_patch[:, :, 1]))
+        v_med = int(np.median(hsv_patch[:, :, 2]))
 
-        h_low = max(0, h_mean - 18)
-        h_high = min(179, h_mean + 18)
-        s_low = max(30, s_mean - 60)
+        # Generous tolerance to capture motion-blurred ball
+        h_low = max(0, h_med - 22)
+        h_high = min(179, h_med + 22)
+        s_low = max(25, s_med - 75)
         s_high = 255
-        v_low = max(30, v_mean - 60)
+        v_low = max(25, v_med - 75)
         v_high = 255
 
         lower = np.array([h_low, s_low, v_low], dtype=np.uint8)
@@ -151,24 +106,10 @@ class PitchTracker:
         self.custom_hsv_upper = upper
         return lower, upper
 
-    def _init_kalman(self) -> None:
-        self.kalman = cv2.KalmanFilter(4, 2)
-        self.kalman.transitionMatrix = np.array(
-            [[1, 0, 1, 0],
-             [0, 1, 0, 1],
-             [0, 0, 1, 0],
-             [0, 0, 0, 1]],
-            dtype=np.float32,
-        )
-        self.kalman.measurementMatrix = np.array(
-            [[1, 0, 0, 0],
-             [0, 1, 0, 0]],
-            dtype=np.float32,
-        )
-        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
-        self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
-        self._kalman_initialized = False
+    def reset_custom_color(self) -> None:
+        """Reset custom HSV to preset defaults."""
+        self.custom_hsv_lower = None
+        self.custom_hsv_upper = None
 
     def set_strike_zone(
         self,
@@ -176,6 +117,7 @@ class PitchTracker:
         roi_box: Optional[Tuple[int, int, int, int]] = None,
         frame_shape: Optional[Tuple[int, int]] = None,
     ) -> None:
+        """Update strike zone and compute pitch corridor bounding box."""
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         pts = zone_polygon.reshape((-1, 2))
 
@@ -187,10 +129,10 @@ class PitchTracker:
             w = max_x - min_x
             h = max_y - min_y
 
-            # Generous pitch corridor: wide horizontal coverage, deep upward mound tunnel
-            margin_x = int(w * 1.0)
-            margin_top = int(h * 3.0)
-            margin_bottom = int(h * 0.25)
+            # Wide horizontal coverage + upward pitching tunnel
+            margin_x = int(w * 1.1)
+            margin_top = int(h * 3.2)
+            margin_bottom = int(h * 0.3)
 
             rx1 = max(0, min_x - margin_x)
             ry1 = max(0, min_y - margin_top)
@@ -210,139 +152,30 @@ class PitchTracker:
         self.trajectory.clear()
         self._frames_without_detection = 0
         self._pitch_active = False
-        self._init_kalman()
 
-    # -----------------------------------------------------------------------
-    # Chromatic Contrast Amplification
-    # -----------------------------------------------------------------------
-    def _compute_chromatic_mask(self, roi_img: np.ndarray) -> np.ndarray:
-        """
-        Transform video using Chromatic Color Contrast Amplification:
-        Highlights neon-green (2G - R - B) and light-blue (2B - R - G) against dark background.
-        """
-        b = roi_img[:, :, 0].astype(np.int16)
-        g = roi_img[:, :, 1].astype(np.int16)
-        r = roi_img[:, :, 2].astype(np.int16)
-
+    def _get_color_mask(self, hsv_roi: np.ndarray) -> np.ndarray:
+        """Generate binary mask for Blitzball colors."""
         if self.custom_hsv_lower is not None and self.custom_hsv_upper is not None:
-            hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-            mask = cv2.inRange(hsv, self.custom_hsv_lower, self.custom_hsv_upper)
-            return cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
-
-        if self.color_mode == "neon_green":
-            # Green Excess Transform
-            chroma = np.clip(2 * g - r - b, 0, 255).astype(np.uint8)
-            _, mask_chroma = cv2.threshold(chroma, 25, 255, cv2.THRESH_BINARY)
-            hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-            mask_hsv = cv2.inRange(hsv, DEFAULT_NEON_LOWER, DEFAULT_NEON_UPPER)
-            mask = cv2.bitwise_or(mask_chroma, mask_hsv)
-
+            mask = cv2.inRange(hsv_roi, self.custom_hsv_lower, self.custom_hsv_upper)
+        elif self.color_mode == "neon_green":
+            mask = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
         elif self.color_mode == "light_blue":
-            # Blue Excess Transform
-            chroma = np.clip(2 * b - r - g, 0, 255).astype(np.uint8)
-            _, mask_chroma = cv2.threshold(chroma, 25, 255, cv2.THRESH_BINARY)
-            hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-            mask_hsv = cv2.inRange(hsv, DEFAULT_BLUE_LOWER, DEFAULT_BLUE_UPPER)
-            mask = cv2.bitwise_or(mask_chroma, mask_hsv)
-
+            mask = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
         else:
-            # Auto: Combine Neon Green and Light Blue Chromatic Amplification
-            chroma_g = np.clip(2 * g - r - b, 0, 255).astype(np.uint8)
-            chroma_b = np.clip(2 * b - r - g, 0, 255).astype(np.uint8)
-            chroma_max = np.maximum(chroma_g, chroma_b)
-            _, mask_chroma = cv2.threshold(chroma_max, 22, 255, cv2.THRESH_BINARY)
+            # Auto: detect both Neon Green and Light Blue
+            m1 = cv2.inRange(hsv_roi, HSV_NEON_LOWER, HSV_NEON_UPPER)
+            m2 = cv2.inRange(hsv_roi, HSV_BLUE_LOWER, HSV_BLUE_UPPER)
+            mask = cv2.bitwise_or(m1, m2)
 
-            hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
-            m1 = cv2.inRange(hsv, DEFAULT_NEON_LOWER, DEFAULT_NEON_UPPER)
-            m2 = cv2.inRange(hsv, DEFAULT_BLUE_LOWER, DEFAULT_BLUE_UPPER)
-            mask = cv2.bitwise_or(mask_chroma, cv2.bitwise_or(m1, m2))
-
+        # Light morphology to remove speckles without eroding moving ball
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, MORPH_KERNEL)
         return mask
 
-    # -----------------------------------------------------------------------
-    # Candidate Extraction
-    # -----------------------------------------------------------------------
-    def _extract_candidates(self, roi_img: np.ndarray, rx1: int, ry1: int) -> Tuple[List[Tuple[int, int, float, int]], np.ndarray]:
-        candidates = []
-
-        # 1. Try YOLO AI model if enabled
-        if self.use_yolo and self.yolo_model is not None:
-            try:
-                results = self.yolo_model.predict(
-                    source=roi_img,
-                    conf=self.yolo_conf,
-                    classes=[32],
-                    verbose=False,
-                    device="cpu",
-                )
-                for r in results:
-                    for box in r.boxes:
-                        xyxy = box.xyxy[0].cpu().numpy()
-                        conf = float(box.conf[0].cpu().numpy())
-                        bw = int(xyxy[2] - xyxy[0])
-                        bh = int(xyxy[3] - xyxy[1])
-                        radius = max(8, int((bw + bh) / 4))
-                        cx = int((xyxy[0] + xyxy[2]) / 2) + rx1
-                        cy = int((xyxy[1] + xyxy[3]) / 2) + ry1
-                        candidates.append((cx, cy, conf + 1.0, radius))
-            except Exception:
-                pass
-
-        # 2. Chromatic Amplification Masking
-        chroma_mask = self._compute_chromatic_mask(roi_img)
-
-        # 3. Temporal Differencing Mask
-        curr_gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-        curr_gray = self.clahe.apply(curr_gray)
-
-        if self.prev_roi_gray is not None and self.prev_roi_gray.shape == curr_gray.shape:
-            diff = cv2.absdiff(curr_gray, self.prev_roi_gray)
-            _, diff_mask = cv2.threshold(diff, 10, 255, cv2.THRESH_BINARY)
-            diff_mask = cv2.dilate(diff_mask, MORPH_KERNEL, iterations=1)
-        else:
-            diff_mask = np.ones_like(curr_gray, dtype=np.uint8) * 255
-        self.prev_roi_gray = curr_gray
-
-        # In active tracking, use full chromatic mask; at idle, require motion intersection
-        if self._pitch_active:
-            fused = chroma_mask
-        else:
-            fused = cv2.bitwise_and(chroma_mask, diff_mask)
-            # If motion diff was too strict, fallback to chroma mask directly
-            if cv2.countNonZero(fused) < 10:
-                fused = chroma_mask
-
-        contours, _ = cv2.findContours(fused, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 6 or area > 5500:
-                continue
-            peri = cv2.arcLength(c, True)
-            if peri == 0:
-                continue
-            circ = 4 * math.pi * (area / (peri**2))
-            if circ < 0.20:
-                continue
-
-            (x, y), radius = cv2.minEnclosingCircle(c)
-            cx = int(x) + rx1
-            cy = int(y) + ry1
-            candidates.append((cx, cy, circ, max(8, int(radius))))
-
-        return candidates, fused
-
-    # -----------------------------------------------------------------------
-    # Main Processing Pipeline
-    # -----------------------------------------------------------------------
     def process_frame(
         self, frame: np.ndarray, timestamp: float
     ) -> Tuple[Optional[Tuple[int, int]], np.ndarray]:
+        """Process video frame and extract ball centroid within pitch corridor."""
         fh, fw = frame.shape[:2]
-
-        # Cooldown lockout
-        if (timestamp - self.last_pitch_timestamp) < self.pitch_cooldown:
-            return None, np.zeros((fh, fw), dtype=np.uint8)
 
         if self.roi_box is not None:
             rx1, ry1, rx2, ry2 = self.roi_box
@@ -355,63 +188,59 @@ class PitchTracker:
         if roi_img.size == 0:
             return None, np.zeros((fh, fw), dtype=np.uint8)
 
-        candidates, roi_mask = self._extract_candidates(roi_img, rx1, ry1)
+        hsv_roi = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+        mask_roi = self._get_color_mask(hsv_roi)
+
+        contours, _ = cv2.findContours(mask_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        candidates = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            # Accommodate both distant ball (small) and near-plate ball (large)
+            if area < 10 or area > 8000:
+                continue
+
+            (x, y), radius = cv2.minEnclosingCircle(c)
+            cx = int(x) + rx1
+            cy = int(y) + ry1
+            candidates.append((cx, cy, area, max(8, int(radius))))
 
         best_point: Optional[Tuple[int, int]] = None
-        best_radius: int = 14
+        best_rad: int = 14
 
-        if self._kalman_initialized:
-            prediction = self.kalman.predict()
-            pred_x, pred_y = float(prediction[0][0]), float(prediction[1][0])
-
-            min_dist = float("inf")
-            for cx, cy, score, rad in candidates:
-                # Discard upward backward jump
-                if len(self.trajectory) >= 2 and cy < self.trajectory[-1][1] - 30:
-                    continue
-
-                dist = math.hypot(cx - pred_x, cy - pred_y)
-                if dist < self.max_frame_displacement and dist < min_dist:
-                    min_dist = dist
-                    best_point = (cx, cy)
-                    best_radius = rad
-
-            if best_point is not None:
-                meas = np.array([[np.float32(best_point[0])], [np.float32(best_point[1])]])
-                self.kalman.correct(meas)
-        else:
-            # Initiate track from candidate
-            if candidates and self.zone_polygon is not None:
-                pts = self.zone_polygon.reshape((-1, 2))
-                zone_bottom = int(np.max(pts[:, 1]))
-
-                valid_starts = [c for c in candidates if c[1] <= zone_bottom + 40]
-                if valid_starts:
-                    valid_starts.sort(key=lambda c: c[2], reverse=True)
-                    best_point = (valid_starts[0][0], valid_starts[0][1])
-                    best_radius = valid_starts[0][3]
-                    self.kalman.statePost = np.array(
-                        [[np.float32(best_point[0])], [np.float32(best_point[1])], [0], [0]],
-                        dtype=np.float32,
-                    )
-                    self._kalman_initialized = True
+        if candidates:
+            if self._pitch_active and self.trajectory:
+                # Track nearest candidate to previous frame position
+                last_x, last_y = self.trajectory[-1][0], self.trajectory[-1][1]
+                min_dist = float("inf")
+                for cx, cy, area, rad in candidates:
+                    dist = math.hypot(cx - last_x, cy - last_y)
+                    if dist < self.max_jump_px and dist < min_dist:
+                        min_dist = dist
+                        best_point = (cx, cy)
+                        best_rad = rad
+            else:
+                # Start new pitch: pick largest candidate inside corridor
+                candidates.sort(key=lambda c: c[2], reverse=True)
+                best_point = (candidates[0][0], candidates[0][1])
+                best_rad = candidates[0][3]
 
         if best_point is not None:
-            self.current_ball_radius = best_radius
+            self.current_ball_radius = best_rad
             self.trajectory.append((best_point[0], best_point[1], timestamp))
             self._frames_without_detection = 0
             self._pitch_active = True
         elif self._pitch_active:
             self._frames_without_detection += 1
 
-        # Full diagnostic frame mask
+        # Diagnostic mask for display
         full_mask = np.zeros((fh, fw), dtype=np.uint8)
-        full_mask[ry1:ry2, rx1:rx2] = roi_mask
+        full_mask[ry1:ry2, rx1:rx2] = mask_roi
 
         return best_point, full_mask
 
     def is_pitch_complete(self) -> bool:
-        """Evaluate if pitch sequence concluded."""
+        """Return True when ball trajectory concludes."""
         if not (self._pitch_active and self._frames_without_detection >= self._gap_threshold):
             return False
 
@@ -423,13 +252,15 @@ class PitchTracker:
         final_pt = self.trajectory[-1]
         y_travel = final_pt[1] - start_pt[1]
 
-        if y_travel < self.min_vertical_travel:
+        # Valid pitch moves forward toward the strike zone
+        if y_travel < self.min_travel_px:
             self.reset()
             return False
 
         return True
 
     def evaluate_pitch(self) -> Optional[Dict]:
+        """Evaluate pitch call against strike zone polygon."""
         if len(self.trajectory) < self.min_pitch_frames:
             return None
 
@@ -439,8 +270,6 @@ class PitchTracker:
         score = cv2.pointPolygonTest(self.zone_polygon, final_pt, False)
         in_zone = score >= 0
         call = "STRIKE" if in_zone else "BALL"
-
-        self.last_pitch_timestamp = self.trajectory[-1][2] if self.trajectory else time.time()
 
         return {
             "call": call,
