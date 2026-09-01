@@ -589,7 +589,7 @@ class VideoCanvas(QWidget):
         def to_widget(fx: float, fy: float) -> QPointF:
             return QPointF(ox + fx * scale, oy + fy * scale)
 
-        # 1. Pitch Corridor Rectangle
+        # 1. Pitch Corridor Rectangle with Release Gate (Top 30%)
         if self.roi_box is not None and not self.is_calibrating_zone and self.show_corridor:
             rx1, ry1, rx2, ry2 = self.roi_box
             p_top_left = to_widget(rx1, ry1)
@@ -600,9 +600,16 @@ class VideoCanvas(QWidget):
             painter.setPen(QPen(QColor(56, 189, 248, 120), 1.8, Qt.DashLine))
             painter.drawRect(roi_rect)
 
+            # Top 30% release gating boundary line
+            y_rel = ry1 + 0.30 * (ry2 - ry1)
+            p_rel_l = to_widget(rx1, y_rel)
+            p_rel_r = to_widget(rx2, y_rel)
+            painter.setPen(QPen(QColor(234, 179, 8, 140), 1.2, Qt.DotLine))
+            painter.drawLine(p_rel_l, p_rel_r)
+
             painter.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
             painter.setPen(QColor(56, 189, 248, 160))
-            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Active Pitch Corridor (ROI)")
+            painter.drawText(int(p_top_left.x()) + 6, int(p_top_left.y()) + 14, "Active Pitch Corridor (Top 30% Release Gate)")
 
         # 2. Strike Zone Polygon & Grid
         poly_to_draw = (

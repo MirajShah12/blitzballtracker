@@ -37,10 +37,16 @@ blitzball/
 ├── main.py            # Master entry point (GUI / CLI launchers)
 ├── tracker.py         # Multi-color HSV detection, corridor ROI & trajectory math
 ├── calibrator.py      # Strike zone 4-point quadrilateral calibration
+├── detector.py        # YOLOv8 / Classical CV pitch detection engine
 ├── state_machine.py   # Blitzball rules engine (5 balls, 2 lobs, 3 strikes, outs, lineups)
 ├── video_source.py    # Multi-source resolver (Webcams, files, yt-dlp caching)
 ├── logger.py          # Box score analytics & JSON export engine
-├── requirements.txt   # Core dependencies (PySide6, OpenCV, NumPy, yt-dlp)
+├── extract_frames.py  # Ingest raw_videos/ and extract sequential pitch frames
+├── label_ball.py      # Interactive CV2 click-to-annotate tool with 4x loupe
+├── prepare_dataset.py # Train/Val 80/20 splitter and data.yaml generator
+├── train_model.py     # Local YOLOv8 training CLI utility
+├── train_colab.ipynb  # Google Colab GPU training notebook
+├── requirements.txt   # Core dependencies (PySide6, OpenCV, NumPy, yt-dlp, ultralytics)
 ├── .gitignore         # Repository ignore rules
 └── README.md          # Documentation & user manual
 ```
@@ -158,6 +164,60 @@ On match conclusion or when clicking **Export Summary**, the session data is sav
   ]
 }
 ```
+
+---
+
+## 🎯 Custom YOLOv8 Blitzball Training Pipeline
+
+Train high-accuracy deep learning Blitzball detection weights tailored to your camera angles and lighting:
+
+```mermaid
+flowchart LR
+    A[Raw Videos in raw_videos/] --> B[extract_frames.py]
+    B --> C[dataset/raw_images/]
+    C --> D[label_ball.py Click-to-Annotate]
+    D --> E[prepare_dataset.py Splitter]
+    E --> F[train_colab.ipynb / train_model.py]
+    F --> G[models/blitzball_detector.pt]
+```
+
+### 1. Extract Frames from Footage
+Drop match video files into `raw_videos/` (or supply `--video` / `--youtube`):
+```bash
+python extract_frames.py --step 2 --active-only
+```
+- Automatically outputs sequential zero-padded frames (`frame_0001.jpg`, `frame_0002.jpg`, ...) to `dataset/raw_images/`.
+
+### 2. Rapid Click-to-Annotate Tool
+Launch the interactive OpenCV labeling canvas:
+```bash
+python label_ball.py
+```
+- **Left Mouse Click**: Register ball center (creates bounding box, default 28x28 px).
+- **Mouse Wheel / `[` `]`**: Dynamically resize bounding box.
+- **`[Space]` / `[Enter]`**: Save YOLO annotation (.txt) and advance.
+- **`[S]`**: Skip frame (marks frame as background / occlusion).
+- **`[R]`**: Reset current frame annotation.
+- **`[A]` / `[D]`**: Navigate backward / forward.
+- **`[Z]`**: Toggle real-time 4x Magnifier Loupe for pixel-accurate centering.
+- **`[Q]`**: Save progress and quit.
+
+### 3. Split Dataset & Generate `data.yaml`
+```bash
+python prepare_dataset.py --val-ratio 0.20 --zip
+```
+- Splits labeled data into standard YOLO `images/train`, `images/val`, `labels/train`, `labels/val` (80/20 ratio).
+- Automatically writes `dataset/data.yaml`.
+- Packages `dataset.zip` for instant upload to Google Colab.
+
+### 4. Train on Google Colab (or Locally)
+- Open [`train_colab.ipynb`](file:///C:/Users/Miraj%20Shah/Desktop/Personal%20Projects/blitzball/train_colab.ipynb) on Google Colab (GPU accelerated: T4 / A100).
+- Run training with `epochs=60`, `imgsz=640`, `batch=16`.
+- Download `blitzball_detector.pt` and place it in `models/blitzball_detector.pt`.
+- Or train locally:
+  ```bash
+  python train_model.py --epochs 60 --imgsz 640 --batch 16
+  ```
 
 ---
 

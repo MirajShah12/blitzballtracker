@@ -1,20 +1,28 @@
 """
-Deep Learning Pitch Tracker with Nearest-Neighbor Velocity Gating,
-Path Plausibility Checking, and 2nd-Degree Polynomial Trajectory Smoothing.
+Deep Learning Pitch Tracker with State-Based Release Gating,
+Strict Area Constraints, Forward Kinematics Gating, and Polynomial Trajectory Smoothing.
 
-Features:
-1. Morphological Cleaning:
-   - Elliptical 3x3 kernel (cv2.MORPH_OPEN) for speckle noise elimination.
-2. Trajectory Association & Velocity Gating:
-   - Projects expected ball coordinate: (x_pred, y_pred) = (x_{t-1} + dx, y_{t-1} + dy).
-   - Strict radius gating around (x_pred, y_pred) — rejects out-of-bounds false positives.
-   - Controlled coasting using predicted position when brief occlusion occurs.
-3. Path Plausibility & Physics Validation:
-   - Rejects sharp direction changes (> 60° vector angle changes) violating projectile motion.
-4. Trajectory Smoothing:
-   - Fits a 2nd-degree polynomial / spline to confirmed pitch coordinates before rendering.
-5. Strike Zone Point-in-Polygon Evaluation:
-   - Evaluates pitches that cross the calibrated physical strike zone plane.
+Architecture:
+1. State-Based Release Gating:
+   - Two-state pipeline: STATE_WAITING_RELEASE and STATE_TRACKING_PITCH.
+   - In STATE_WAITING_RELEASE: only accepts ball candidates detected in the top 30%
+     of the pitch corridor (near pitcher's release point).
+   - Transitions to STATE_TRACKING_PITCH only when a valid release centroid is found.
+
+2. Strict Area & Spatial Constraints:
+   - Caps candidate contour area strictly between 40 and 800 px^2 (configurable).
+   - Immediately discards contours > 800 px^2 to prevent locking onto batter legs/shoes/bat.
+
+3. Forward Kinematics Gating:
+   - Requires frame-to-frame candidate motion to have positive forward/downward velocity
+     (dy > 0 towards home plate).
+   - Constrains candidate selection to a local radius (r = 50px) around the predicted
+     position from the previous trajectory vector.
+   - Stops pitch tracking when the ball reaches the strike zone plate plane or when
+     no valid candidates exist for 4 consecutive frames.
+
+4. 2nd-Degree Polynomial Trajectory Smoothing:
+   - Broadcast-quality trajectory spline smoothing and strike zone polygon evaluation.
 """
 
 from collections import deque
@@ -30,9 +38,13 @@ from detector import BlitzballDetector
 
 ELLIPTICAL_KERNEL_3X3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
+# Pipeline States
+STATE_WAITING_RELEASE = "STATE_WAITING_RELEASE"
+STATE_TRACKING_PITCH = "STATE_TRACKING_PITCH"
+
 
 class PitchTracker:
-    """Deep learning pitch tracker with velocity gating and polynomial smoothing."""
+    """Deep learning pitch tracker with release gating, forward kinematics, and polynomial smoothing."""
 
     def __init__(
         self,
@@ -41,16 +53,36 @@ class PitchTracker:
         conf_thresh: float = 0.25,
         roi_box: Optional[Tuple[int, int, int, int]] = None,
         max_trajectory_len: int = 60,
-        gate_radius: float = 65.0,
+        gate_radius: float = 50.0,
         max_coast_frames: int = 2,
+        min_contour_area: float = 40.0,
+        max_contour_area: float = 800.0,
+        release_corridor_ratio: float = 0.30,
+        max_consecutive_misses: int = 4,
+        min_forward_velocity: float = 0.0,
     ):
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         self.roi_box: Optional[Tuple[int, int, int, int]] = roi_box
+
+        # Configurable Tracking & Spatial Constraints
+        self.gate_radius: float = gate_radius  # Local radius constraint (r = 50px)
+        self.max_coast_frames: int = max_coast_frames
+        self.min_contour_area: float = min_contour_area  # 40 px^2
+        self.max_contour_area: float = max_contour_area  # 800 px^2
+        self.release_corridor_ratio: float = release_corridor_ratio  # Top 30% of corridor
+        self.max_consecutive_misses: int = max_consecutive_misses  # 4 consecutive frames
+        self.min_forward_velocity: float = min_forward_velocity  # dy > 0 towards plate
+        self.max_vector_angle_deg: float = 60.0  # Max angular deflection in flight
+
+        # Strike zone plate plane y-coordinate (bottom edge of calibrated zone polygon)
+        self.plate_plane_y: float = float(np.max(self.zone_polygon[:, :, 1]))
 
         # Deep Learning Detector
         self.detector = BlitzballDetector(
             weights_path=weights_path,
             conf_thresh=conf_thresh,
+            min_contour_area=min_contour_area,
+            max_contour_area=max_contour_area,
         )
 
         # FIFO Trajectory Buffer [(x, y, timestamp)]
@@ -58,22 +90,17 @@ class PitchTracker:
         self.current_ball_radius: int = 14
         self.current_confidence: float = 0.0
 
-        # Velocity Gating & Path Plausibility Settings
-        self.gate_radius: float = gate_radius
-        self.max_coast_frames: int = max_coast_frames
+        # State-Based Tracking Pipeline State
+        self.state: str = STATE_WAITING_RELEASE
+        self._pitch_active: bool = False
+        self._reached_plate_plane: bool = False
+        self._frames_without_detection: int = 0
         self._consecutive_coasts: int = 0
-        self.max_vector_angle_deg: float = 60.0  # Max angular deflection in flight
 
-        # Flight completion thresholds
+        # Pitch Completion Validation Parameters
         self.min_pitch_frames: int = 2
         self.min_travel_px: float = 8.0
-        self.max_jump_px: float = 220.0
-
-        # Lifecycle state
         self.last_pitch_timestamp: float = -999.0
-        self._frames_without_detection: int = 0
-        self._pitch_active: bool = False
-        self._gap_threshold: int = 5
 
         if roi_box is not None:
             self.roi_box = roi_box
@@ -99,8 +126,10 @@ class PitchTracker:
         roi_box: Optional[Tuple[int, int, int, int]] = None,
         frame_shape: Optional[Tuple[int, int]] = None,
     ) -> None:
+        """Update strike zone polygon, plate plane reference, and pitch corridor."""
         self.zone_polygon = zone_polygon.reshape((-1, 1, 2)).astype(np.float32)
         pts = zone_polygon.reshape((-1, 2))
+        self.plate_plane_y = float(np.max(pts[:, 1]))
 
         if roi_box is not None:
             self.roi_box = roi_box
@@ -127,13 +156,16 @@ class PitchTracker:
             self.roi_box = (rx1, ry1, rx2, ry2)
 
     def reset(self) -> None:
+        """Reset tracking pipeline back to STATE_WAITING_RELEASE."""
+        self.state = STATE_WAITING_RELEASE
         self.trajectory.clear()
         self._frames_without_detection = 0
         self._consecutive_coasts = 0
         self._pitch_active = False
+        self._reached_plate_plane = False
 
     # -----------------------------------------------------------------------
-    # Velocity Estimation & Trajectory Association
+    # Velocity Estimation & Kinematics Validation
     # -----------------------------------------------------------------------
     def _estimate_velocity(self) -> Tuple[float, float]:
         """
@@ -157,7 +189,7 @@ class PitchTracker:
             p2 = self.trajectory[-1]
             return float(p2[0] - p1[0]), float(p2[1] - p1[1])
         else:
-            # Default initial pitch direction toward the plate
+            # Default initial pitch downward direction toward the plate
             return 0.0, 15.0
 
     def _is_angle_plausible(
@@ -189,8 +221,8 @@ class PitchTracker:
         self, frame: np.ndarray, timestamp: float
     ) -> Tuple[Optional[Tuple[int, int]], np.ndarray]:
         """
-        Runs YOLO / CV detection, performs nearest-neighbor velocity gating and
-        path plausibility checking, and maintains the pitch trajectory.
+        Runs detection with State-Based Release Gating, Strict Area & Spatial Constraints,
+        and Forward Kinematics Gating.
         """
         fh, fw = frame.shape[:2]
 
@@ -200,89 +232,138 @@ class PitchTracker:
         best_point: Optional[Tuple[int, int]] = None
         best_rad: int = 14
         best_conf: float = 0.0
-        is_coasted: bool = False
 
+        # Filter candidate detections against strict area constraints [min_contour_area, max_contour_area]
+        valid_candidates = []
         if detections:
-            # Filter for ball class detections
-            ball_dets = [d for d in detections if "zone" not in d[5].lower()]
-            if not ball_dets:
-                ball_dets = detections
+            for det in detections:
+                cx, cy, bw, bh, conf, cls_name = det[:6]
+                if "zone" in cls_name.lower():
+                    continue
+                area = bw * bh
+                # Strict area filtering: immediately discard contours < 40 or > 800 px^2
+                if self.min_contour_area <= area <= self.max_contour_area:
+                    valid_candidates.append(det)
 
-            if self._pitch_active and self.trajectory:
+        # 2. State-Based Tracking Pipeline Execution
+        if self.state == STATE_WAITING_RELEASE:
+            # In STATE_WAITING_RELEASE: only accept ball candidates detected in the top 30%
+            # of the pitch corridor (near pitcher's release point)
+            if self.roi_box is not None:
+                rx1, ry1, rx2, ry2 = self.roi_box
+                y_release_max = ry1 + self.release_corridor_ratio * (ry2 - ry1)
+                release_candidates = [
+                    d for d in valid_candidates
+                    if rx1 <= d[0] <= rx2 and ry1 <= d[1] <= y_release_max
+                ]
+            else:
+                y_release_max = self.release_corridor_ratio * fh
+                release_candidates = [
+                    d for d in valid_candidates
+                    if 0 <= d[1] <= y_release_max
+                ]
+
+            if release_candidates:
+                # Transition to STATE_TRACKING_PITCH only when a valid release centroid is found
+                release_candidates.sort(key=lambda d: d[4], reverse=True)
+                best_det = release_candidates[0]
+                best_point = (best_det[0], best_det[1])
+                best_rad = max(8, int((best_det[2] + best_det[3]) / 4))
+                best_conf = best_det[4]
+
+                self.current_ball_radius = best_rad
+                self.current_confidence = best_conf
+                self.trajectory.append((best_point[0], best_point[1], timestamp))
+                self.state = STATE_TRACKING_PITCH
+                self._pitch_active = True
+                self._frames_without_detection = 0
+                self._consecutive_coasts = 0
+
+                if best_point[1] >= self.plate_plane_y:
+                    self._reached_plate_plane = True
+
+        elif self.state == STATE_TRACKING_PITCH:
+            # Active in-flight pitch tracking
+            if not self._reached_plate_plane and self.trajectory:
                 last_x, last_y = self.trajectory[-1][0], self.trajectory[-1][1]
                 dx, dy = self._estimate_velocity()
 
-                # Project expected ball position (x_pred, y_pred)
+                # Predicted position from previous trajectory vector
                 pred_x = last_x + dx
                 pred_y = last_y + dy
 
-                # Adaptive gating radius scaled to velocity
-                v_mag = math.hypot(dx, dy)
-                gate_r = max(self.gate_radius, min(self.max_jump_px, 1.8 * v_mag))
-
                 best_dist = float("inf")
 
-                for cx, cy, bw, bh, conf, _ in ball_dets:
-                    # 1. Distance to predicted coordinate (x_pred, y_pred)
-                    dist_pred = math.hypot(cx - pred_x, cy - pred_y)
-                    if dist_pred > gate_r:
-                        continue  # Out-of-bounds candidate rejected as false positive
+                for cx, cy, bw, bh, conf, _ in valid_candidates:
+                    # 1. Forward Kinematics: Require positive forward/downward velocity (dy > 0 towards plate)
+                    cand_dy = cy - last_y
+                    if cand_dy <= self.min_forward_velocity:
+                        continue  # Rejects upward or static movement
 
-                    # 2. Path Plausibility: Check angular direction change <= 60°
+                    # 2. Local Radius Constraint: Must be within radius (r = gate_radius = 50px)
+                    dist_pred = math.hypot(cx - pred_x, cy - pred_y)
+                    if dist_pred > self.gate_radius:
+                        continue  # Rejects false positives outside local prediction radius
+
+                    # 3. Path Plausibility: Check vector deflection angle <= 60°
                     cand_v = (cx - last_x, cy - last_y)
                     if not self._is_angle_plausible((dx, dy), cand_v):
-                        continue  # Sharp reversal / vector violation rejected
+                        continue  # Rejects impossible directional reversals
 
-                    # Nearest-neighbor match to predicted coordinate
+                    # Select candidate closest to predicted position
                     if dist_pred < best_dist:
                         best_dist = dist_pred
                         best_point = (cx, cy)
                         best_rad = max(8, int((bw + bh) / 4))
                         best_conf = conf
 
-            else:
-                # Start new pitch: pick highest confidence detection in corridor
-                ball_dets.sort(key=lambda d: d[4], reverse=True)
-                best_point = (ball_dets[0][0], ball_dets[0][1])
-                best_rad = max(8, int((ball_dets[0][2] + ball_dets[0][3]) / 4))
-                best_conf = ball_dets[0][4]
+                if best_point is not None:
+                    self.current_ball_radius = best_rad
+                    self.current_confidence = best_conf
+                    self.trajectory.append((best_point[0], best_point[1], timestamp))
+                    self._frames_without_detection = 0
+                    self._consecutive_coasts = 0
 
-        # 2. Controlled Coasting / Miss Handling
-        if best_point is not None:
-            self.current_ball_radius = best_rad
-            self.current_confidence = best_conf
-            self.trajectory.append((best_point[0], best_point[1], timestamp))
-            self._frames_without_detection = 0
-            self._consecutive_coasts = 0
-            self._pitch_active = True
-        elif self._pitch_active:
-            self._frames_without_detection += 1
-            # Check if we can coast using projected position for short occlusion
-            if self._consecutive_coasts < self.max_coast_frames and len(self.trajectory) >= 2:
-                last_x, last_y = self.trajectory[-1][0], self.trajectory[-1][1]
-                dx, dy = self._estimate_velocity()
-                coast_x = int(last_x + dx)
-                coast_y = int(last_y + dy)
+                    # Stop condition: ball reaches strike zone plate plane
+                    if best_point[1] >= self.plate_plane_y:
+                        self._reached_plate_plane = True
+                else:
+                    self._frames_without_detection += 1
+                    # Controlled coasting if brief occlusion occurs and not exceeded max misses
+                    if (
+                        self._consecutive_coasts < self.max_coast_frames
+                        and len(self.trajectory) >= 2
+                        and self._frames_without_detection < self.max_consecutive_misses
+                    ):
+                        coast_x = int(last_x + dx)
+                        coast_y = int(last_y + dy)
 
-                # Check if coast coordinate remains inside corridor
-                in_corridor = True
-                if self.roi_box is not None:
-                    rx1, ry1, rx2, ry2 = self.roi_box
-                    if not (rx1 <= coast_x <= rx2 and ry1 <= coast_y <= ry2):
-                        in_corridor = False
+                        in_corridor = True
+                        if self.roi_box is not None:
+                            rx1, ry1, rx2, ry2 = self.roi_box
+                            if not (rx1 <= coast_x <= rx2 and ry1 <= coast_y <= ry2):
+                                in_corridor = False
 
-                if in_corridor and dy > -5:
-                    self.trajectory.append((coast_x, coast_y, timestamp))
-                    self._consecutive_coasts += 1
-                    best_point = (coast_x, coast_y)
+                        if in_corridor and dy > self.min_forward_velocity:
+                            self.trajectory.append((coast_x, coast_y, timestamp))
+                            self._consecutive_coasts += 1
+                            best_point = (coast_x, coast_y)
+                            if coast_y >= self.plate_plane_y:
+                                self._reached_plate_plane = True
+            elif self._reached_plate_plane:
+                self._frames_without_detection += 1
 
         # 3. Generate Diagnostic Visual Mask with Morphological Cleaning
         diag_mask = np.zeros((fh, fw), dtype=np.uint8)
         if self.roi_box is not None:
             rx1, ry1, rx2, ry2 = self.roi_box
             cv2.rectangle(diag_mask, (rx1, ry1), (rx2, ry2), 40, -1)
+            # Delineate release gating top 30% zone
+            y_rel = int(ry1 + self.release_corridor_ratio * (ry2 - ry1))
+            cv2.rectangle(diag_mask, (rx1, ry1), (rx2, y_rel), 70, -1)
 
-        for cx, cy, bw, bh, conf, _ in detections:
+        for det in valid_candidates:
+            cx, cy, bw, bh = det[0], det[1], det[2], det[3]
             cv2.circle(diag_mask, (cx, cy), max(8, int((bw + bh) / 4)), 255, -1)
 
         # Apply morphological OPEN to remove any isolated speckle noise
@@ -295,7 +376,7 @@ class PitchTracker:
     # -----------------------------------------------------------------------
     def get_smoothed_trajectory(self, num_samples: int = 35) -> List[Tuple[float, float]]:
         """
-        Fits a 2nd-degree polynomial curve to the confirmed pitch coordinates
+        Fits a 2nd-degree polynomial curve to confirmed pitch coordinates
         and returns smoothly interpolated (x, y) coordinates for broadcast rendering.
         """
         pts = list(self.trajectory)
@@ -325,12 +406,23 @@ class PitchTracker:
 
             return [(float(xs), float(ys)) for xs, ys in zip(x_smooth, y_smooth)]
         except Exception:
-            # Fallback to linear trajectory
             return [(float(p[0]), float(p[1])) for p in pts]
 
     def is_pitch_complete(self) -> bool:
-        """Evaluate pitch conclusion based on gap threshold and minimum vertical flight."""
-        if not (self._pitch_active and self._frames_without_detection >= self._gap_threshold):
+        """
+        Evaluate pitch conclusion:
+        - Stops when the ball reaches the strike zone plate plane, OR
+        - Stops when no valid candidates exist for 4 consecutive frames.
+        """
+        if not (self.state == STATE_TRACKING_PITCH or self._pitch_active):
+            return False
+
+        has_stopped = (
+            self._reached_plate_plane
+            or self._frames_without_detection >= self.max_consecutive_misses
+        )
+
+        if not has_stopped:
             return False
 
         if len(self.trajectory) < self.min_pitch_frames:
@@ -375,9 +467,15 @@ class PitchTracker:
         }
 
     def draw_overlay(self, frame: np.ndarray, zone_polygon: np.ndarray) -> np.ndarray:
-        """Draw strike zone and 2nd-degree polynomial smoothed glowing trajectory trail."""
+        """Draw strike zone, release gating boundary, and trajectory trail."""
         pts = zone_polygon.reshape((-1, 1, 2))
         cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        # Draw pitch corridor and top 30% release gating line if roi_box is set
+        if self.roi_box is not None:
+            rx1, ry1, rx2, ry2 = self.roi_box
+            y_rel = int(ry1 + self.release_corridor_ratio * (ry2 - ry1))
+            cv2.line(frame, (rx1, y_rel), (rx2, y_rel), (255, 200, 0), 1, cv2.LINE_AA)
 
         # 2nd-Degree Polynomial Smoothed Trajectory Trail
         smoothed = self.get_smoothed_trajectory(num_samples=35)

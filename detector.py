@@ -39,12 +39,16 @@ class BlitzballDetector:
         iou_thresh: float = 0.45,
         imgsz: int = 320,
         device: Optional[str] = None,
+        min_contour_area: float = 40.0,
+        max_contour_area: float = 800.0,
     ):
         self.weights_path = weights_path
         self.fallback_model = fallback_model
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
         self.imgsz = imgsz
+        self.min_contour_area = min_contour_area
+        self.max_contour_area = max_contour_area
 
         if device is None:
             if ULTRALYTICS_AVAILABLE and torch.cuda.is_available():
@@ -142,6 +146,10 @@ class BlitzballDetector:
                         x1, y1, x2, y2 = xyxy
                         bw = int(x2 - x1)
                         bh = int(y2 - y1)
+                        box_area = bw * bh
+                        if not (self.min_contour_area <= box_area <= self.max_contour_area):
+                            continue
+
                         cx = int((x1 + x2) / 2) + ox
                         cy = int((y1 + y2) / 2) + oy
 
@@ -158,7 +166,7 @@ class BlitzballDetector:
     def _detect_cv_fallback(
         self, crop: np.ndarray, ox: int, oy: int
     ) -> List[Tuple[int, int, int, int, float, str]]:
-        """High-speed color blob fallback with morphological cleaning."""
+        """High-speed color blob fallback with morphological cleaning and strict area gating."""
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         # Neon Green & Light Blue mask
         m1 = cv2.inRange(hsv, np.array([20, 30, 30]), np.array([92, 255, 255]))
@@ -172,11 +180,13 @@ class BlitzballDetector:
         detections = []
         for c in contours:
             area = cv2.contourArea(c)
-            if 8 < area < 8000:
+            # Strictly cap candidate contour area between min_contour_area (40) and max_contour_area (800)
+            # Immediately discard contours > 800 px^2 (batter legs/shoes/bat) or < 40 px^2 (noise)
+            if self.min_contour_area <= area <= self.max_contour_area:
                 (x, y), radius = cv2.minEnclosingCircle(c)
                 cx = int(x) + ox
                 cy = int(y) + oy
-                rad = max(8, int(radius))
+                rad = max(6, int(radius))
                 detections.append((cx, cy, rad * 2, rad * 2, 0.70, "blitzball"))
 
         # Sort by area descending

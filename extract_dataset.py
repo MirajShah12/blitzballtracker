@@ -78,7 +78,7 @@ def pseudo_label_frame(frame: np.ndarray) -> List[Tuple[int, float, float, float
 
     for c in contours:
         area = cv2.contourArea(c)
-        if 15 < area < 6000:
+        if 40 <= area <= 800:
             x, y, w, h = cv2.boundingRect(c)
             # Add padding
             pad = 4

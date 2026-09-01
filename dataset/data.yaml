@@ -1,0 +1,8 @@
+# Blitzball YOLO Detection Dataset Configuration
+path: .
+train: images/train
+val: images/val
+
+# Classes
+names:
+  0: blitzball
